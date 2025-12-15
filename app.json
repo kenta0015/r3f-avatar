@@ -1,0 +1,7 @@
+{
+  "plugins": [
+    "expo-asset"
+  ],
+  "name": "r3f-avatar-mvp",
+  "slug": "r3f-avatar-mvp"
+}
