@@ -3,7 +3,6 @@ import "react-native-gesture-handler";
 import "@expo/metro-runtime";
 import DebugMessagesScreen from "./DebugMessagesScreen";
 
-
 import React, { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   StyleSheet,
@@ -26,8 +25,7 @@ import { Asset } from "expo-asset";
 import { Audio } from "expo-av";
 import type { GLTF } from "three-stdlib";
 
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-
+import { createClient, type SupabaseClient, type RealtimeChannel } from "@supabase/supabase-js";
 
 const _log = console.log.bind(console);
 console.log = (...args: any[]) => {
@@ -35,7 +33,6 @@ console.log = (...args: any[]) => {
   if (msg.includes("EXGL: gl.pixelStorei() doesn't support this parameter yet!")) return;
   _log(...args);
 };
-
 
 if (!globalThis.__FETCH_LOGGER_INSTALLED__) {
   globalThis.__FETCH_LOGGER_INSTALLED__ = true;
@@ -45,13 +42,11 @@ if (!globalThis.__FETCH_LOGGER_INSTALLED__) {
 
   globalThis.fetch = async (input: any, init?: any) => {
     const method = (init?.method || "GET").toUpperCase();
-    const url =
-      typeof input === "string" ? input : input?.url ? input.url : String(input);
+    const url = typeof input === "string" ? input : input?.url ? input.url : String(input);
 
     const isPolly = POLLY_BASE ? url.startsWith(POLLY_BASE) : url.includes("lambda-url");
     if (!isPolly) return originalFetch(input, init);
 
-    // Keep it readable (avoid huge text param)
     const safeUrl = url.replace(/text=[^&]*/i, "text=<omitted>");
 
     console.log("\n=== POLLY REQUEST ===");
@@ -61,7 +56,11 @@ if (!globalThis.__FETCH_LOGGER_INSTALLED__) {
       const res = await originalFetch(input, init);
       console.log("[POLLY]", "status", res.status);
       console.log("[POLLY]", "content-type", res.headers.get("content-type"));
-      console.log("[POLLY]", "isBase64", res.headers.get("content-type")?.includes("audio/") ? "audio" : "non-audio");
+      console.log(
+        "[POLLY]",
+        "isBase64",
+        res.headers.get("content-type")?.includes("audio/") ? "audio" : "non-audio"
+      );
       console.log("=====================\n");
       return res;
     } catch (e: any) {
@@ -71,7 +70,6 @@ if (!globalThis.__FETCH_LOGGER_INSTALLED__) {
     }
   };
 }
-
 
 type RootStackParamList = {
   Landing: undefined;
@@ -84,16 +82,9 @@ const Stack = createNativeStackNavigator<RootStackParamList>();
 type LandingProps = NativeStackScreenProps<RootStackParamList, "Landing">;
 type ExperienceProps = NativeStackScreenProps<RootStackParamList, "Experience">;
 
-// Put your Ready Player Me avatar here:
-//   /assets/avatar.glb
-//
-
-// For MVP fastest TTS:
-// prefer .env (EXPO_PUBLIC_POLLY_URL). Fallback keeps old URL so nothing breaks.
 const POLLY_LAMBDA_BASE_URL =
   (process.env.EXPO_PUBLIC_POLLY_URL || "").trim() ||
   "https://xlt57x5dyt6ymnc7waumag2ywy0vluso.lambda-url.us-east-1.on.aws/";
-
 
 type MessageLog = {
   id: string;
@@ -106,6 +97,26 @@ type MessageLog = {
 };
 
 type AuthStatus = "idle" | "loading" | "ready" | "error";
+
+type DbMessageRow = {
+  id: string;
+  user_id: string;
+  name: string;
+  message: string;
+  created_at: string;
+};
+
+function isDbMessageRow(value: any): value is DbMessageRow {
+  return (
+    value &&
+    typeof value === "object" &&
+    typeof value.id === "string" &&
+    typeof value.user_id === "string" &&
+    typeof value.name === "string" &&
+    typeof value.message === "string" &&
+    typeof value.created_at === "string"
+  );
+}
 
 function makeId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -156,15 +167,10 @@ function LoadingFallback() {
   );
 }
 
-// AFTER: AvatarModel（jawOpenを探して揺らす）+ Canvas側で mouthActive を渡す
-
 function AvatarModel({ uri, mouthActive }: { uri: string; mouthActive: boolean }) {
   const gltf = useGLTF(uri) as unknown as GLTF;
 
-  // Cache all morph targets we can control (jawOpen / mouthOpen fallback)
-  const targetsRef = useRef<
-    { influences: number[]; index: number }[]
-  >([]);
+  const targetsRef = useRef<{ influences: number[]; index: number }[]>([]);
 
   useEffect(() => {
     const targets: { influences: number[]; index: number }[] = [];
@@ -175,11 +181,7 @@ function AvatarModel({ uri, mouthActive }: { uri: string; mouthActive: boolean }
 
       if (!dict || !influences || !Array.isArray(influences)) return;
 
-      const jawIndex =
-        dict["jawOpen"] ??
-        dict["JawOpen"] ??
-        dict["mouthOpen"] ??
-        dict["MouthOpen"];
+      const jawIndex = dict["jawOpen"] ?? dict["JawOpen"] ?? dict["mouthOpen"] ?? dict["MouthOpen"];
 
       if (typeof jawIndex === "number") {
         targets.push({ influences, index: jawIndex });
@@ -193,9 +195,8 @@ function AvatarModel({ uri, mouthActive }: { uri: string; mouthActive: boolean }
     const targets = targetsRef.current;
     if (!targets.length) return;
 
-    // Simple fake lip motion while audio is playing
     const t = state.clock.getElapsedTime();
-    const v = mouthActive ? (0.35 + 0.35 * Math.sin(t * 12)) : 0;
+    const v = mouthActive ? 0.35 + 0.35 * Math.sin(t * 12) : 0;
 
     for (const trg of targets) {
       trg.influences[trg.index] = v;
@@ -204,10 +205,6 @@ function AvatarModel({ uri, mouthActive }: { uri: string; mouthActive: boolean }
 
   return <primitive object={gltf.scene} position={[0, -1.6, 0]} scale={[1, 1, 1]} />;
 }
-
-
-
-
 
 function LandingScreen({ navigation }: LandingProps) {
   return (
@@ -247,15 +244,27 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
 
   const [name, setName] = useState("");
   const [message, setMessage] = useState("");
+
   const [logs, setLogs] = useState<MessageLog[]>([]);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isSending, setIsSending] = useState(false);
 
   const soundRef = useRef<Audio.Sound | null>(null);
 
   const supabaseRef = useRef<SupabaseClient | null>(null);
+  const realtimeChannelRef = useRef<RealtimeChannel | null>(null);
+
   const [authStatus, setAuthStatus] = useState<AuthStatus>("idle");
   const [authUserId, setAuthUserId] = useState<string>("");
   const [authError, setAuthError] = useState<string>("");
+
+  const [realtimeStatus, setRealtimeStatus] = useState<string>("idle");
+
+  const pendingSpeakRef = useRef<{
+    name: string;
+    message: string;
+    requestedAt: number;
+  } | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -303,6 +312,73 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
     };
   }, []);
 
+  function buildTtsUrl(text: string) {
+    const u = new URL(POLLY_LAMBDA_BASE_URL);
+    u.searchParams.set("text", text);
+    u.searchParams.set("voiceId", "Joanna");
+    u.searchParams.set("format", "mp3");
+    u.searchParams.set("engine", "neural");
+    u.searchParams.set("tone", "healing");
+    const built = u.toString();
+    console.log("[POLLY] URL", built.replace(/text=[^&]*/i, "text=<omitted>"));
+    return u.toString();
+  }
+
+  function setLogStatus(id: string, next: Partial<MessageLog>) {
+    setLogs((prev) => prev.map((l) => (l.id === id ? { ...l, ...next } : l)));
+  }
+
+  async function playTtsForLog(logId: string, ttsUrl: string) {
+    setIsSpeaking(true);
+    setLogStatus(logId, { status: "loading", ttsUrl });
+
+    try {
+      if (soundRef.current) {
+        try {
+          await soundRef.current.unloadAsync();
+        } catch {
+          // ignore
+        }
+        soundRef.current = null;
+      }
+
+      {
+        const safeUrl = ttsUrl.replace(/text=[^&]*/i, "text=<omitted>");
+        console.log("[POLLY] preflight GET", safeUrl);
+
+        const res = await fetch(ttsUrl, { method: "GET" });
+        console.log("[POLLY] preflight status", res.status);
+
+        if (!res.ok) {
+          throw new Error(`Polly/Lambda request failed: HTTP ${res.status}`);
+        }
+      }
+
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: ttsUrl },
+        { shouldPlay: true, volume: 1.0 },
+        (status) => {
+          if (!status.isLoaded) return;
+
+          if (status.isPlaying) {
+            setLogStatus(logId, { status: "playing" });
+          }
+
+          if (status.didJustFinish) {
+            setIsSpeaking(false);
+            setLogStatus(logId, { status: "ready" });
+          }
+        }
+      );
+
+      soundRef.current = sound;
+      setLogStatus(logId, { status: "playing" });
+    } catch (e: any) {
+      setIsSpeaking(false);
+      setLogStatus(logId, { status: "error", errorMessage: String(e?.message || e) });
+    }
+  }
+
   useEffect(() => {
     let alive = true;
 
@@ -310,14 +386,13 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
       setAuthStatus("loading");
       setAuthError("");
       setAuthUserId("");
+      setRealtimeStatus("idle");
 
       try {
         const { url, anonKey } = getSupabaseEnv();
 
         if (!url || !anonKey) {
-          throw new Error(
-            "Missing Supabase env vars. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY."
-          );
+          throw new Error("Missing Supabase env vars. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.");
         }
 
         if (!supabaseRef.current) {
@@ -365,158 +440,194 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
     };
   }, []);
 
+  async function selectMyMessages() {
+    if (!supabaseRef.current || !authUserId) return;
 
+    try {
+      const supabase = supabaseRef.current;
 
-// AFTER (ExperienceScreen 内：Step6-E 最短 = Speakで DB INSERT → 自分だけ SELECT で一覧更新)
+      const { data, error } = await supabase
+        .from("messages")
+        .select("id, user_id, name, message, created_at")
+        .eq("user_id", authUserId)
+        .order("created_at", { ascending: false })
+        .limit(30);
 
-// 追加：DB SELECT（自分だけ）
-async function reloadMyMessages() {
-  if (!supabaseRef.current) return;
-  if (!authUserId) return;
+      if (error) return;
 
-  const supabase = supabaseRef.current;
-  const { data, error } = await supabase
-    .from("messages")
-    .select("id, user_id, name, message, created_at")
-    .eq("user_id", authUserId)
-    .order("created_at", { ascending: false })
-    .limit(20);
+      const mapped: MessageLog[] =
+        (data as any[])?.map((row: any) => ({
+          id: String(row?.id || makeId()),
+          name: String(row?.name || ""),
+          message: String(row?.message || ""),
+          createdAt: row?.created_at ? new Date(row.created_at).getTime() : Date.now(),
+          ttsUrl: "",
+          status: "ready",
+        })) ?? [];
 
-  if (error) {
-    return;
-  }
-
-  const mapped: MessageLog[] =
-    data?.map((row: any) => ({
-      id: row.id,
-      name: row.name,
-      message: row.message,
-      createdAt: new Date(row.created_at).getTime(),
-      ttsUrl: "",
-      status: "ready",
-    })) ?? [];
-
-  setLogs(mapped);
-}
-
-// ===== Step 6-1: FETCH MY MESSAGES (自分だけ) =====
-useEffect(() => {
-  if (authStatus !== "ready") return;
-  if (!supabaseRef.current) return;
-  if (!authUserId) return;
-
-  void reloadMyMessages();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [authStatus, authUserId]);
-// ===== END Step 6-1 =====
-
-// 追加：DB INSERT
-async function insertMessageToDb(safeName: string, safeMessage: string) {
-  if (!supabaseRef.current) throw new Error("Supabase client not ready");
-  if (!authUserId) throw new Error("authUserId missing");
-
-  const supabase = supabaseRef.current;
-  const { error } = await supabase.from("messages").insert({
-    user_id: authUserId,
-    name: safeName,
-    message: safeMessage,
-  });
-
-  if (error) throw error;
-}
-
-async function speak() {
-  const safeName = name.trim();
-  const safeMessage = message.trim();
-
-  if (!safeName || !safeMessage) return;
-  if (authStatus !== "ready" || !authUserId || !supabaseRef.current) return;
-
-  const ttsUrl = buildTtsUrl(safeMessage);
-  const id = makeId();
-
-  // まずローカルに仮カード（UI即反応）
-  const newLog: MessageLog = {
-    id,
-    name: safeName,
-    message: safeMessage,
-    createdAt: Date.now(),
-    ttsUrl,
-    status: "loading",
-  };
-
-  setLogs((prev) => [newLog, ...prev]);
-  setIsSpeaking(true);
-
-  try {
-    // ✅ Step6-E: DB INSERT → SELECTで一覧をDB由来に更新
-    await insertMessageToDb(safeName, safeMessage);
-    await reloadMyMessages();
-
-    // （Step7相当の音声は今のまま残す）
-    if (soundRef.current) {
-      await soundRef.current.unloadAsync();
-      soundRef.current = null;
-    }
-
-    // ✅ Guarantee we can see HTTP status 200/4xx/5xx in logs
-// (expo-av may not go through global fetch on Android/iOS)
-{
-  const safeUrl = ttsUrl.replace(/text=[^&]*/i, "text=<omitted>");
-  console.log("[POLLY] preflight GET", safeUrl);
-
-  const res = await fetch(ttsUrl, { method: "GET" });
-  console.log("[POLLY] preflight status", res.status);
-
-  if (!res.ok) {
-    throw new Error(`Polly/Lambda request failed: HTTP ${res.status}`);
-  }
-}
-
-const { sound } = await Audio.Sound.createAsync(
-  { uri: ttsUrl },
-  { shouldPlay: true, volume: 1.0 },
-  (status) => {
-    if (!status.isLoaded) return;
-    if (status.isPlaying) {
-      setLogs((prev) =>
-        prev.map((l) => (l.id === id ? { ...l, status: "playing" as const } : l))
-      );
-    }
-    if (status.didJustFinish) {
-      setIsSpeaking(false);
-      setLogs((prev) =>
-        prev.map((l) => (l.id === id ? { ...l, status: "ready" as const } : l))
-      );
+      setLogs(mapped);
+    } catch {
+      // ignore
     }
   }
-);
 
+  async function insertMessageToDb(safeName: string, safeMessage: string) {
+    if (!supabaseRef.current) throw new Error("Supabase client not ready");
+    if (!authUserId) throw new Error("authUserId missing");
 
-    soundRef.current = sound;
-    setLogs((prev) => prev.map((l) => (l.id === id ? { ...l, status: "playing" } : l)));
-  } catch (e: any) {
-    setIsSpeaking(false);
-    setLogs((prev) =>
-      prev.map((l) =>
-        l.id === id ? { ...l, status: "error", errorMessage: String(e?.message || e) } : l
+    const supabase = supabaseRef.current;
+    const { error } = await supabase.from("messages").insert({
+      user_id: authUserId,
+      name: safeName,
+      message: safeMessage,
+    });
+
+    if (error) throw error;
+  }
+
+  useEffect(() => {
+    if (authStatus !== "ready") return;
+    if (!supabaseRef.current || !authUserId) return;
+    void selectMyMessages();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authStatus, authUserId]);
+
+  useEffect(() => {
+    if (authStatus !== "ready") return;
+    if (!supabaseRef.current || !authUserId) return;
+
+    const supabase = supabaseRef.current;
+
+    if (realtimeChannelRef.current) {
+      try {
+        supabase.removeChannel(realtimeChannelRef.current);
+      } catch {
+        // ignore
+      }
+      realtimeChannelRef.current = null;
+    }
+
+    setRealtimeStatus("subscribing");
+
+    const channel = supabase
+      .channel(`experience-messages-inserts:${authUserId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "messages",
+          filter: `user_id=eq.${authUserId}`,
+        },
+        (payload: any) => {
+          const next = payload?.new;
+          if (!isDbMessageRow(next)) return;
+
+          const nextLog: MessageLog = {
+            id: next.id,
+            name: next.name,
+            message: next.message,
+            createdAt: new Date(next.created_at).getTime(),
+            ttsUrl: "",
+            status: "ready",
+          };
+
+          setLogs((prev) => {
+            if (prev.some((r) => r.id === nextLog.id)) return prev;
+            const merged = [nextLog, ...prev];
+            return merged.slice(0, 30);
+          });
+
+          const pending = pendingSpeakRef.current;
+          if (!pending) return;
+
+          const ageMs = Date.now() - pending.requestedAt;
+          const same = pending.name.trim() === next.name.trim() && pending.message.trim() === next.message.trim();
+
+          if (same && ageMs >= 0 && ageMs < 15_000) {
+            pendingSpeakRef.current = null;
+            const ttsUrl = buildTtsUrl(next.message);
+            void playTtsForLog(next.id, ttsUrl);
+            setIsSending(false);
+          }
+        }
       )
-    );
+      .subscribe((status: any) => {
+        setRealtimeStatus(String(status || "unknown"));
+      });
+
+    realtimeChannelRef.current = channel;
+
+    return () => {
+      if (realtimeChannelRef.current) {
+        try {
+          supabase.removeChannel(realtimeChannelRef.current);
+        } catch {
+          // ignore
+        }
+        realtimeChannelRef.current = null;
+      }
+      setRealtimeStatus("idle");
+    };
+  }, [authStatus, authUserId]);
+
+  async function speak() {
+    const safeName = name.trim();
+    const safeMessage = message.trim();
+
+    if (!safeName || !safeMessage) return;
+    if (authStatus !== "ready" || !authUserId || !supabaseRef.current) return;
+    if (isSending || isSpeaking) return;
+
+    setIsSending(true);
+
+    try {
+      pendingSpeakRef.current = {
+        name: safeName,
+        message: safeMessage,
+        requestedAt: Date.now(),
+      };
+
+      await insertMessageToDb(safeName, safeMessage);
+
+      // Step9: No reload. The Realtime INSERT handler will add the row and trigger audio playback.
+      // If Realtime fails, user can still see rows via initial SELECT and retry auth if needed.
+    } catch (e: any) {
+      pendingSpeakRef.current = null;
+      setIsSending(false);
+
+      const id = makeId();
+      const ttsUrl = buildTtsUrl(safeMessage);
+
+      const errorLog: MessageLog = {
+        id,
+        name: safeName,
+        message: safeMessage,
+        createdAt: Date.now(),
+        ttsUrl,
+        status: "error",
+        errorMessage: String(e?.message || e),
+      };
+
+      setLogs((prev) => [errorLog, ...prev].slice(0, 30));
+    }
   }
-}
 
   async function retryAuth() {
     setAuthStatus("loading");
     setAuthError("");
     setAuthUserId("");
+    setRealtimeStatus("idle");
+    setLogs([]);
+    pendingSpeakRef.current = null;
+    setIsSending(false);
+    setIsSpeaking(false);
 
     try {
       const { url, anonKey } = getSupabaseEnv();
 
       if (!url || !anonKey) {
-        throw new Error(
-          "Missing Supabase env vars. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY."
-        );
+        throw new Error("Missing Supabase env vars. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.");
       }
 
       if (!supabaseRef.current) {
@@ -530,6 +641,15 @@ const { sound } = await Audio.Sound.createAsync(
       }
 
       const supabase = supabaseRef.current;
+
+      if (realtimeChannelRef.current) {
+        try {
+          supabase.removeChannel(realtimeChannelRef.current);
+        } catch {
+          // ignore
+        }
+        realtimeChannelRef.current = null;
+      }
 
       const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
       if (sessionError) throw sessionError;
@@ -552,50 +672,24 @@ const { sound } = await Audio.Sound.createAsync(
     }
   }
 
-  
-
-
-  
-
-
-
-const camera = useMemo(
-  () => ({
-    position: [0, 0.4, 0.9] as [number, number, number],
-    fov: 28,
-  }),
-  []
-);
-
-
-
-function buildTtsUrl(text: string) {
-  const u = new URL(POLLY_LAMBDA_BASE_URL);
-  u.searchParams.set("text", text);
-  u.searchParams.set("voiceId", "Joanna");
-  u.searchParams.set("format", "mp3");
-  u.searchParams.set("engine", "neural");
-  u.searchParams.set("tone", "healing");
-  // Log the exact final URL shape (hide huge text)
-  const built = u.toString();
-  console.log("[POLLY] URL", built.replace(/text=[^&]*/i, "text=<omitted>"));
-  return u.toString();
-}
-
-
+  const camera = useMemo(
+    () => ({
+      position: [0, 0.4, 0.9] as [number, number, number],
+      fov: 28,
+    }),
+    []
+  );
 
   const canSpeak =
     authStatus === "ready" &&
     !!authUserId &&
     name.trim().length > 0 &&
     message.trim().length > 0 &&
-    !isSpeaking;
+    !isSpeaking &&
+    !isSending;
 
   return (
-    <KeyboardAvoidingView
-      style={styles.experienceContainer}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
-    >
+    <KeyboardAvoidingView style={styles.experienceContainer} behavior={Platform.OS === "ios" ? "padding" : undefined}>
       <View style={styles.experienceHeader}>
         <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backButton}>
           <Text style={styles.backButtonText}>Back</Text>
@@ -605,17 +699,16 @@ function buildTtsUrl(text: string) {
 
         <View style={styles.backButtonSpacer} />
       </View>
+
       <View style={styles.canvasWrap}>
-        
         <Canvas
           camera={camera}
           shadows
           onCreated={({ camera }) => {
-          camera.lookAt(0, 0.0, 0);
-          camera.updateProjectionMatrix();
-                }}  
-                >
-
+            camera.lookAt(0, 0.0, 0);
+            camera.updateProjectionMatrix();
+          }}
+        >
           <color attach="background" args={["#000000"]} />
 
           <ambientLight intensity={0.6} />
@@ -627,11 +720,11 @@ function buildTtsUrl(text: string) {
           <Suspense fallback={<LoadingFallback />}>
             {avatarError ? (
               <RotatingBox position={[0, 0, 0]} />
-                ) : avatarUri ? (
+            ) : avatarUri ? (
               <AvatarModel uri={avatarUri} mouthActive={isSpeaking} />
-                ) : (
+            ) : (
               <LoadingFallback />
-                  )}
+            )}
           </Suspense>
         </Canvas>
       </View>
@@ -657,6 +750,12 @@ function buildTtsUrl(text: string) {
               <Text style={styles.authUid} numberOfLines={1}>
                 {authUserId}
               </Text>
+
+              <View style={{ height: 8 }} />
+              <View style={styles.authTopRow}>
+                <Text style={styles.authLabel}>Realtime</Text>
+                <Text style={styles.authStatus}>{realtimeStatus}</Text>
+              </View>
             </>
           ) : authStatus === "error" ? (
             <>
@@ -708,17 +807,15 @@ function buildTtsUrl(text: string) {
           </View>
         </View>
 
-        <TouchableOpacity
-          style={[styles.speakButton, !canSpeak ? styles.speakButtonDisabled : null]}
-          disabled={!canSpeak}
-          onPress={speak}
-        >
-          <Text style={styles.speakButtonText}>{isSpeaking ? "Speaking..." : "Speak"}</Text>
+        <TouchableOpacity style={[styles.speakButton, !canSpeak ? styles.speakButtonDisabled : null]} disabled={!canSpeak} onPress={speak}>
+          <Text style={styles.speakButtonText}>
+            {isSpeaking ? "Speaking..." : isSending ? "Sending..." : "Speak"}
+          </Text>
         </TouchableOpacity>
 
         <View style={styles.logsHeader}>
-          <Text style={styles.logsTitle}>Messages (local)</Text>
-          <Text style={styles.logsHint}>TTS plays via your Polly Lambda URL</Text>
+          <Text style={styles.logsTitle}>Messages (DB)</Text>
+          <Text style={styles.logsHint}>Insert triggers Realtime → card auto-add</Text>
         </View>
 
         <ScrollView style={styles.logsList} contentContainerStyle={styles.logsContent}>
@@ -773,7 +870,6 @@ export default function App() {
         <Stack.Screen name="Landing" component={LandingScreen} />
         <Stack.Screen name="Experience" component={ExperienceScreen} />
         <Stack.Screen name="DebugMessages" component={DebugMessagesScreen} />
-
       </Stack.Navigator>
     </NavigationContainer>
   );
@@ -1072,4 +1168,3 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
 });
-

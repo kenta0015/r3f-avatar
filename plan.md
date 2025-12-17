@@ -1,4 +1,4 @@
-了解。いまの状況（900 行 App.tsx を崩したくない／時間ない／まず DB を確実に動かす）に合わせて、Step6〜11 を“迷わず進むためのプラン”に再設計します。
+いまの状況（900 行 App.tsx を崩したくない／時間ない／まず DB を確実に動かす）に合わせて、Step6〜11 を“迷わず進むためのプラン”に設計します。
 
 全体方針（これでブレない）
 
@@ -11,7 +11,8 @@ Step6 は「DB の INSERT/SELECT が確実に動く」ことが本体。
 口パクや最適化は後回し。評価に直結する “動く証拠” を先に確保。
 
 Step6〜11：練り直しプラン（最新版）
-Step6：UI 動作（入力 → INSERT → SELECT → 表示）
+
+## Step6：UI 動作（入力 → INSERT → SELECT → 表示） step6 A-E まで完了！！
 
 Step6-A（Debug 画面を追加）
 
@@ -54,7 +55,7 @@ Experience の Speak は一旦「音声なし」でも OK（Step7 でやる）
 
 ✅ DoD（Step6）：Experience で「Speak（または Send）→ DB に INSERT → 自分の行を SELECT して一覧に出る」
 
-Step7：音声（Polly で再生）
+## Step7：音声（Polly で再生）　完了！！
 
 Step6 の INSERT/SELECT が終わったらやる
 
@@ -70,7 +71,7 @@ Polly URL 生成 → expo-av 再生
 
 ✅ DoD（Step7）：押すたびにメッセージ音声が鳴る
 
-Step8：口パク（まず動けば OK）
+## Step8：口パク（まず動けば OK） 完了！！
 
 “精度”じゃなく “動く” を最優先
 
@@ -80,7 +81,7 @@ Step8：口パク（まず動けば OK）
 
 ✅ DoD（Step8）：再生中に口が何かしら動く
 
-Step9：Realtime（自分の INSERT だけ購読）
+## Step9：Realtime（自分の INSERT だけ購読）
 
 messages の INSERT を subscribe
 
@@ -90,7 +91,7 @@ Insert 後の Reload を消して、購読で追加されるのを見せる
 
 ✅ DoD（Step9）：Insert 直後に自動でカード追加（自分のみ）
 
-Step10：パフォーマンス（低コスト 3 点）
+## Step10：パフォーマンス（低コスト 3 点）
 
 ロード中 UI（Suspense fallback は既にある）
 
@@ -100,19 +101,10 @@ GLB preload（or Asset caching で 2 回目高速化）
 
 ✅ DoD（Step10）：ロード中固まらない + 2 回目速い
 
-Step11：提出物（落とさない）
+## Step11：提出物（落とさない）
 
 README（セットアップ、.env、Supabase 作成、messages テーブル、実行手順）
 
 スクショ or 動画リンク（Landing→Experience→Speak→ カード増える → 音声 → 口パク）
 
 ✅ DoD（Step11）：第三者が手順通りに再現できる
-
-次にやるのはこれ（今から 2 ステップだけ）
-
-Step6-A：Debug 画面を追加
-Step6-B：その画面で INSERT/SELECT を完成
-
-この 2 つが終われば、Experience に移植して Step6 が確実に終わります。
-
-次の返答で、あなたの今の構成に合わせて「Debug 画面をどこにぶら下げるか（Stack に 1 枚足す）」を前提に、Step6-A/B の実装方針を“迷わないレベル”で確定します。

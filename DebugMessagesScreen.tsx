@@ -12,7 +12,7 @@ import {
   Platform,
   KeyboardAvoidingView,
 } from "react-native";
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient, type RealtimeChannel } from "@supabase/supabase-js";
 
 type AuthStatus = "idle" | "loading" | "ready" | "error";
 
@@ -30,8 +30,21 @@ function getSupabaseEnv() {
   return { url, anonKey };
 }
 
+function isDbMessageRow(value: any): value is DbMessageRow {
+  return (
+    value &&
+    typeof value === "object" &&
+    typeof value.id === "string" &&
+    typeof value.user_id === "string" &&
+    typeof value.name === "string" &&
+    typeof value.message === "string" &&
+    typeof value.created_at === "string"
+  );
+}
+
 export default function DebugMessagesScreen() {
   const supabaseRef = useRef<SupabaseClient | null>(null);
+  const realtimeChannelRef = useRef<RealtimeChannel | null>(null);
 
   const [authStatus, setAuthStatus] = useState<AuthStatus>("idle");
   const [authUserId, setAuthUserId] = useState<string>("");
@@ -44,8 +57,16 @@ export default function DebugMessagesScreen() {
   const [busy, setBusy] = useState<boolean>(false);
   const [lastActionError, setLastActionError] = useState<string>("");
 
+  const [realtimeStatus, setRealtimeStatus] = useState<string>("idle");
+
   const canInsert = useMemo(() => {
-    return authStatus === "ready" && !!authUserId && name.trim().length > 0 && message.trim().length > 0 && !busy;
+    return (
+      authStatus === "ready" &&
+      !!authUserId &&
+      name.trim().length > 0 &&
+      message.trim().length > 0 &&
+      !busy
+    );
   }, [authStatus, authUserId, name, message, busy]);
 
   const canSelect = useMemo(() => {
@@ -60,6 +81,7 @@ export default function DebugMessagesScreen() {
       setAuthError("");
       setAuthUserId("");
       setLastActionError("");
+      setRealtimeStatus("idle");
 
       try {
         const { url, anonKey } = getSupabaseEnv();
@@ -159,7 +181,7 @@ export default function DebugMessagesScreen() {
 
       if (error) throw error;
 
-      await selectMyMessages();
+      // Step 9: no reload here. UI should update via Realtime subscription.
     } catch (e: any) {
       setLastActionError(String(e?.message || e));
     } finally {
@@ -167,11 +189,71 @@ export default function DebugMessagesScreen() {
     }
   }
 
+  // Initial SELECT when auth is ready (one-time load of existing rows)
   useEffect(() => {
     if (authStatus !== "ready") return;
     void selectMyMessages();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authStatus]);
+
+  // Step 9: Realtime subscribe to INSERT (my user_id only)
+  useEffect(() => {
+    if (authStatus !== "ready") return;
+    if (!supabaseRef.current || !authUserId) return;
+
+    const supabase = supabaseRef.current;
+
+    // Safety: ensure we don't keep multiple channels alive (double inserts)
+    if (realtimeChannelRef.current) {
+      try {
+        supabase.removeChannel(realtimeChannelRef.current);
+      } catch {
+        // ignore
+      }
+      realtimeChannelRef.current = null;
+    }
+
+    setRealtimeStatus("subscribing");
+
+    const channel = supabase
+      .channel(`debug-messages-inserts:${authUserId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "messages",
+          filter: `user_id=eq.${authUserId}`,
+        },
+        (payload: any) => {
+          const next = payload?.new;
+          if (!isDbMessageRow(next)) return;
+
+          setRows((prev) => {
+            if (prev.some((r) => r.id === next.id)) return prev;
+            const merged = [next, ...prev];
+            return merged.slice(0, 30);
+          });
+        }
+      )
+      .subscribe((status: any) => {
+        setRealtimeStatus(String(status || "unknown"));
+      });
+
+    realtimeChannelRef.current = channel;
+
+    return () => {
+      if (realtimeChannelRef.current) {
+        try {
+          supabase.removeChannel(realtimeChannelRef.current);
+        } catch {
+          // ignore
+        }
+        realtimeChannelRef.current = null;
+      }
+      setRealtimeStatus("idle");
+    };
+  }, [authStatus, authUserId]);
 
   async function retryAuth() {
     setAuthStatus("loading");
@@ -179,6 +261,7 @@ export default function DebugMessagesScreen() {
     setAuthUserId("");
     setRows([]);
     setLastActionError("");
+    setRealtimeStatus("idle");
 
     try {
       const { url, anonKey } = getSupabaseEnv();
@@ -197,6 +280,16 @@ export default function DebugMessagesScreen() {
       }
 
       const supabase = supabaseRef.current;
+
+      // Cleanup any existing realtime channel before re-auth
+      if (realtimeChannelRef.current) {
+        try {
+          supabase.removeChannel(realtimeChannelRef.current);
+        } catch {
+          // ignore
+        }
+        realtimeChannelRef.current = null;
+      }
 
       const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
       if (sessionError) throw sessionError;
@@ -225,7 +318,7 @@ export default function DebugMessagesScreen() {
       <SafeAreaView style={styles.safe}>
         <View style={styles.header}>
           <Text style={styles.title}>Debug: Messages INSERT / SELECT</Text>
-          <Text style={styles.subtitle}>This screen tests Step 6 without touching App.tsx</Text>
+          <Text style={styles.subtitle}>This screen tests Step 6–9 without touching App.tsx</Text>
         </View>
 
         <View style={styles.card}>
@@ -248,6 +341,12 @@ export default function DebugMessagesScreen() {
               <Text style={styles.value} numberOfLines={1}>
                 {authUserId}
               </Text>
+
+              <View style={{ height: 8 }} />
+              <View style={styles.rowBetween}>
+                <Text style={styles.label}>Realtime</Text>
+                <Text style={styles.mutedSmall}>{realtimeStatus}</Text>
+              </View>
             </>
           ) : authStatus === "error" ? (
             <>
@@ -526,3 +625,4 @@ const styles = StyleSheet.create({
     lineHeight: 16,
   },
 });
+
