@@ -1,5 +1,8 @@
+// FILE: App.tsx
 import "react-native-gesture-handler";
 import "@expo/metro-runtime";
+import DebugMessagesScreen from "./DebugMessagesScreen";
+
 
 import React, { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -25,9 +28,55 @@ import type { GLTF } from "three-stdlib";
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
+
+const _log = console.log.bind(console);
+console.log = (...args: any[]) => {
+  const msg = String(args?.[0] ?? "");
+  if (msg.includes("EXGL: gl.pixelStorei() doesn't support this parameter yet!")) return;
+  _log(...args);
+};
+
+
+if (!globalThis.__FETCH_LOGGER_INSTALLED__) {
+  globalThis.__FETCH_LOGGER_INSTALLED__ = true;
+
+  const originalFetch = globalThis.fetch.bind(globalThis);
+  const POLLY_BASE = (process.env.EXPO_PUBLIC_POLLY_URL || "").trim();
+
+  globalThis.fetch = async (input: any, init?: any) => {
+    const method = (init?.method || "GET").toUpperCase();
+    const url =
+      typeof input === "string" ? input : input?.url ? input.url : String(input);
+
+    const isPolly = POLLY_BASE ? url.startsWith(POLLY_BASE) : url.includes("lambda-url");
+    if (!isPolly) return originalFetch(input, init);
+
+    // Keep it readable (avoid huge text param)
+    const safeUrl = url.replace(/text=[^&]*/i, "text=<omitted>");
+
+    console.log("\n=== POLLY REQUEST ===");
+    console.log("[POLLY]", method, safeUrl);
+
+    try {
+      const res = await originalFetch(input, init);
+      console.log("[POLLY]", "status", res.status);
+      console.log("[POLLY]", "content-type", res.headers.get("content-type"));
+      console.log("[POLLY]", "isBase64", res.headers.get("content-type")?.includes("audio/") ? "audio" : "non-audio");
+      console.log("=====================\n");
+      return res;
+    } catch (e: any) {
+      console.log("[POLLY]", "ERROR", e?.message || String(e));
+      console.log("=====================\n");
+      throw e;
+    }
+  };
+}
+
+
 type RootStackParamList = {
   Landing: undefined;
   Experience: undefined;
+  DebugMessages: undefined;
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -38,9 +87,13 @@ type ExperienceProps = NativeStackScreenProps<RootStackParamList, "Experience">;
 // Put your Ready Player Me avatar here:
 //   /assets/avatar.glb
 //
+
 // For MVP fastest TTS:
-// use your existing Lambda URL (Polly proxy)
-const POLLY_LAMBDA_BASE_URL = "https://xlt57x5dyt6ymnc7waumag2ywy0vluso.lambda-url.us-east-1.on.aws/";
+// prefer .env (EXPO_PUBLIC_POLLY_URL). Fallback keeps old URL so nothing breaks.
+const POLLY_LAMBDA_BASE_URL =
+  (process.env.EXPO_PUBLIC_POLLY_URL || "").trim() ||
+  "https://xlt57x5dyt6ymnc7waumag2ywy0vluso.lambda-url.us-east-1.on.aws/";
+
 
 type MessageLog = {
   id: string;
@@ -103,10 +156,58 @@ function LoadingFallback() {
   );
 }
 
-function AvatarModel({ uri }: { uri: string }) {
+// AFTER: AvatarModel（jawOpenを探して揺らす）+ Canvas側で mouthActive を渡す
+
+function AvatarModel({ uri, mouthActive }: { uri: string; mouthActive: boolean }) {
   const gltf = useGLTF(uri) as unknown as GLTF;
+
+  // Cache all morph targets we can control (jawOpen / mouthOpen fallback)
+  const targetsRef = useRef<
+    { influences: number[]; index: number }[]
+  >([]);
+
+  useEffect(() => {
+    const targets: { influences: number[]; index: number }[] = [];
+
+    gltf.scene.traverse((obj: any) => {
+      const dict = obj?.morphTargetDictionary;
+      const influences = obj?.morphTargetInfluences;
+
+      if (!dict || !influences || !Array.isArray(influences)) return;
+
+      const jawIndex =
+        dict["jawOpen"] ??
+        dict["JawOpen"] ??
+        dict["mouthOpen"] ??
+        dict["MouthOpen"];
+
+      if (typeof jawIndex === "number") {
+        targets.push({ influences, index: jawIndex });
+      }
+    });
+
+    targetsRef.current = targets;
+  }, [gltf]);
+
+  useFrame((state) => {
+    const targets = targetsRef.current;
+    if (!targets.length) return;
+
+    // Simple fake lip motion while audio is playing
+    const t = state.clock.getElapsedTime();
+    const v = mouthActive ? (0.35 + 0.35 * Math.sin(t * 12)) : 0;
+
+    for (const trg of targets) {
+      trg.influences[trg.index] = v;
+    }
+  });
+
   return <primitive object={gltf.scene} position={[0, -1.6, 0]} scale={[1, 1, 1]} />;
 }
+
+
+
+
 
 function LandingScreen({ navigation }: LandingProps) {
   return (
@@ -124,6 +225,10 @@ function LandingScreen({ navigation }: LandingProps) {
 
         <TouchableOpacity style={styles.primaryButton} onPress={() => navigation.navigate("Experience")}>
           <Text style={styles.primaryButtonText}>Enter Experience</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.primaryButton} onPress={() => navigation.navigate("DebugMessages")}>
+          <Text style={styles.primaryButtonText}>Open Debug Messages</Text>
         </TouchableOpacity>
       </View>
     </SafeAreaView>
@@ -260,82 +365,145 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
     };
   }, []);
 
-  const camera = useMemo(
-    () => ({
-      position: [0, 1.2, 3.0] as [number, number, number],
-      fov: 45,
-    }),
-    []
-  );
 
-  function buildTtsUrl(text: string) {
-    const u = new URL(POLLY_LAMBDA_BASE_URL);
-    u.searchParams.set("text", text);
-    u.searchParams.set("voiceId", "Joanna");
-    u.searchParams.set("format", "mp3");
-    u.searchParams.set("engine", "neural");
-    u.searchParams.set("tone", "healing");
-    return u.toString();
+
+// AFTER (ExperienceScreen 内：Step6-E 最短 = Speakで DB INSERT → 自分だけ SELECT で一覧更新)
+
+// 追加：DB SELECT（自分だけ）
+async function reloadMyMessages() {
+  if (!supabaseRef.current) return;
+  if (!authUserId) return;
+
+  const supabase = supabaseRef.current;
+  const { data, error } = await supabase
+    .from("messages")
+    .select("id, user_id, name, message, created_at")
+    .eq("user_id", authUserId)
+    .order("created_at", { ascending: false })
+    .limit(20);
+
+  if (error) {
+    return;
   }
 
-  async function speak() {
-    const safeName = name.trim();
-    const safeMessage = message.trim();
+  const mapped: MessageLog[] =
+    data?.map((row: any) => ({
+      id: row.id,
+      name: row.name,
+      message: row.message,
+      createdAt: new Date(row.created_at).getTime(),
+      ttsUrl: "",
+      status: "ready",
+    })) ?? [];
 
-    if (!safeName || !safeMessage) return;
+  setLogs(mapped);
+}
 
-    const ttsUrl = buildTtsUrl(safeMessage);
-    const id = makeId();
+// ===== Step 6-1: FETCH MY MESSAGES (自分だけ) =====
+useEffect(() => {
+  if (authStatus !== "ready") return;
+  if (!supabaseRef.current) return;
+  if (!authUserId) return;
 
-    const newLog: MessageLog = {
-      id,
-      name: safeName,
-      message: safeMessage,
-      createdAt: Date.now(),
-      ttsUrl,
-      status: "loading",
-    };
+  void reloadMyMessages();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [authStatus, authUserId]);
+// ===== END Step 6-1 =====
 
-    setLogs((prev) => [newLog, ...prev]);
-    setIsSpeaking(true);
+// 追加：DB INSERT
+async function insertMessageToDb(safeName: string, safeMessage: string) {
+  if (!supabaseRef.current) throw new Error("Supabase client not ready");
+  if (!authUserId) throw new Error("authUserId missing");
 
-    try {
-      if (soundRef.current) {
-        await soundRef.current.unloadAsync();
-        soundRef.current = null;
-      }
+  const supabase = supabaseRef.current;
+  const { error } = await supabase.from("messages").insert({
+    user_id: authUserId,
+    name: safeName,
+    message: safeMessage,
+  });
 
-      const { sound } = await Audio.Sound.createAsync(
-        { uri: ttsUrl },
-        { shouldPlay: true, volume: 1.0 },
-        (status) => {
-          if (!status.isLoaded) return;
-          if (status.isPlaying) {
-            setLogs((prev) =>
-              prev.map((l) => (l.id === id ? { ...l, status: "playing" as const } : l))
-            );
-          }
-          if (status.didJustFinish) {
-            setIsSpeaking(false);
-            setLogs((prev) =>
-              prev.map((l) => (l.id === id ? { ...l, status: "ready" as const } : l))
-            );
-          }
-        }
+  if (error) throw error;
+}
+
+async function speak() {
+  const safeName = name.trim();
+  const safeMessage = message.trim();
+
+  if (!safeName || !safeMessage) return;
+  if (authStatus !== "ready" || !authUserId || !supabaseRef.current) return;
+
+  const ttsUrl = buildTtsUrl(safeMessage);
+  const id = makeId();
+
+  // まずローカルに仮カード（UI即反応）
+  const newLog: MessageLog = {
+    id,
+    name: safeName,
+    message: safeMessage,
+    createdAt: Date.now(),
+    ttsUrl,
+    status: "loading",
+  };
+
+  setLogs((prev) => [newLog, ...prev]);
+  setIsSpeaking(true);
+
+  try {
+    // ✅ Step6-E: DB INSERT → SELECTで一覧をDB由来に更新
+    await insertMessageToDb(safeName, safeMessage);
+    await reloadMyMessages();
+
+    // （Step7相当の音声は今のまま残す）
+    if (soundRef.current) {
+      await soundRef.current.unloadAsync();
+      soundRef.current = null;
+    }
+
+    // ✅ Guarantee we can see HTTP status 200/4xx/5xx in logs
+// (expo-av may not go through global fetch on Android/iOS)
+{
+  const safeUrl = ttsUrl.replace(/text=[^&]*/i, "text=<omitted>");
+  console.log("[POLLY] preflight GET", safeUrl);
+
+  const res = await fetch(ttsUrl, { method: "GET" });
+  console.log("[POLLY] preflight status", res.status);
+
+  if (!res.ok) {
+    throw new Error(`Polly/Lambda request failed: HTTP ${res.status}`);
+  }
+}
+
+const { sound } = await Audio.Sound.createAsync(
+  { uri: ttsUrl },
+  { shouldPlay: true, volume: 1.0 },
+  (status) => {
+    if (!status.isLoaded) return;
+    if (status.isPlaying) {
+      setLogs((prev) =>
+        prev.map((l) => (l.id === id ? { ...l, status: "playing" as const } : l))
       );
-
-      soundRef.current = sound;
-
-      setLogs((prev) => prev.map((l) => (l.id === id ? { ...l, status: "playing" } : l)));
-    } catch (e: any) {
+    }
+    if (status.didJustFinish) {
       setIsSpeaking(false);
       setLogs((prev) =>
-        prev.map((l) =>
-          l.id === id ? { ...l, status: "error", errorMessage: String(e?.message || e) } : l
-        )
+        prev.map((l) => (l.id === id ? { ...l, status: "ready" as const } : l))
       );
     }
   }
+);
+
+
+    soundRef.current = sound;
+    setLogs((prev) => prev.map((l) => (l.id === id ? { ...l, status: "playing" } : l)));
+  } catch (e: any) {
+    setIsSpeaking(false);
+    setLogs((prev) =>
+      prev.map((l) =>
+        l.id === id ? { ...l, status: "error", errorMessage: String(e?.message || e) } : l
+      )
+    );
+  }
+}
 
   async function retryAuth() {
     setAuthStatus("loading");
@@ -384,7 +552,44 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
     }
   }
 
-  const canSpeak = name.trim().length > 0 && message.trim().length > 0 && !isSpeaking;
+  
+
+
+  
+
+
+
+const camera = useMemo(
+  () => ({
+    position: [0, 0.4, 0.9] as [number, number, number],
+    fov: 28,
+  }),
+  []
+);
+
+
+
+function buildTtsUrl(text: string) {
+  const u = new URL(POLLY_LAMBDA_BASE_URL);
+  u.searchParams.set("text", text);
+  u.searchParams.set("voiceId", "Joanna");
+  u.searchParams.set("format", "mp3");
+  u.searchParams.set("engine", "neural");
+  u.searchParams.set("tone", "healing");
+  // Log the exact final URL shape (hide huge text)
+  const built = u.toString();
+  console.log("[POLLY] URL", built.replace(/text=[^&]*/i, "text=<omitted>"));
+  return u.toString();
+}
+
+
+
+  const canSpeak =
+    authStatus === "ready" &&
+    !!authUserId &&
+    name.trim().length > 0 &&
+    message.trim().length > 0 &&
+    !isSpeaking;
 
   return (
     <KeyboardAvoidingView
@@ -400,9 +605,17 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
 
         <View style={styles.backButtonSpacer} />
       </View>
-
       <View style={styles.canvasWrap}>
-        <Canvas camera={camera} shadows>
+        
+        <Canvas
+          camera={camera}
+          shadows
+          onCreated={({ camera }) => {
+          camera.lookAt(0, 0.0, 0);
+          camera.updateProjectionMatrix();
+                }}  
+                >
+
           <color attach="background" args={["#000000"]} />
 
           <ambientLight intensity={0.6} />
@@ -414,11 +627,11 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
           <Suspense fallback={<LoadingFallback />}>
             {avatarError ? (
               <RotatingBox position={[0, 0, 0]} />
-            ) : avatarUri ? (
-              <AvatarModel uri={avatarUri} />
-            ) : (
+                ) : avatarUri ? (
+              <AvatarModel uri={avatarUri} mouthActive={isSpeaking} />
+                ) : (
               <LoadingFallback />
-            )}
+                  )}
           </Suspense>
         </Canvas>
       </View>
@@ -428,7 +641,13 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
           <View style={styles.authTopRow}>
             <Text style={styles.authTitle}>Supabase Auth (Anonymous)</Text>
             <Text style={styles.authStatus}>
-              {authStatus === "loading" ? "loading" : authStatus === "ready" ? "ready" : authStatus === "error" ? "error" : "idle"}
+              {authStatus === "loading"
+                ? "loading"
+                : authStatus === "ready"
+                ? "ready"
+                : authStatus === "error"
+                ? "error"
+                : "idle"}
             </Text>
           </View>
 
@@ -553,6 +772,8 @@ export default function App() {
       <Stack.Navigator id="RootStack" initialRouteName="Landing" screenOptions={{ headerShown: false }}>
         <Stack.Screen name="Landing" component={LandingScreen} />
         <Stack.Screen name="Experience" component={ExperienceScreen} />
+        <Stack.Screen name="DebugMessages" component={DebugMessagesScreen} />
+
       </Stack.Navigator>
     </NavigationContainer>
   );
@@ -851,3 +1072,4 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
 });
+
