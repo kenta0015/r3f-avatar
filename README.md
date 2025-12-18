@@ -10,7 +10,7 @@ On **Web**, the app uses **Wawa Lipsync** to drive mouth morph targets from the 
 
 ## Demo
 
-- Demo video: `https://youtu.be/HtVsSOyrdqU`
+- Demo video: <https://youtu.be/HtVsSOyrdqU>
 
 ---
 
