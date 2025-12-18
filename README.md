@@ -1,4 +1,4 @@
-# R3F Avatar MVP — Real-Time Supabase Messaging + TTS + (Web) Wawa Lipsync
+# R3F Avatar MVP — Real-Time Supabase Messaging + TTS + Wawa Lipsync
 
 A React Native (Expo) app that renders a 3D avatar + simple 3D environment using **React Three Fiber**, lets users enter **Name + Message**, then saves messages to **Supabase** (user-isolated), subscribes via **Realtime**, and plays **TTS audio**.  
 On **Web**, the app uses **Wawa Lipsync** to drive mouth morph targets from the generated speech audio.
