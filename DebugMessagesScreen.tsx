@@ -12,9 +12,19 @@ import {
   Platform,
   KeyboardAvoidingView,
 } from "react-native";
-import { createClient, type SupabaseClient, type RealtimeChannel } from "@supabase/supabase-js";
+import type { RealtimeChannel } from "@supabase/supabase-js";
+import { supabase } from "./supabaseClient";
+
+import { getOrCreateSessionId } from "./src/session/sessionId";
 
 type AuthStatus = "idle" | "loading" | "ready" | "error";
+
+// Step 11-2(B): fixed scope (string) to isolate this app's rows/policies.
+// You can override via .env: EXPO_PUBLIC_MESSAGE_SCOPE=...
+const MESSAGE_SCOPE: string =
+  (process.env as any)?.EXPO_PUBLIC_MESSAGE_SCOPE ||
+  (process.env as any)?.EXPO_PUBLIC_MESSAGES_SCOPE ||
+  "r3f-avatar-mvp";
 
 type DbMessageRow = {
   id: string;
@@ -22,13 +32,9 @@ type DbMessageRow = {
   name: string;
   message: string;
   created_at: string;
+  session_id?: string | null;
+  scope?: string | null;
 };
-
-function getSupabaseEnv() {
-  const url = (process.env.EXPO_PUBLIC_SUPABASE_URL || "").trim();
-  const anonKey = (process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || "").trim();
-  return { url, anonKey };
-}
 
 function isDbMessageRow(value: any): value is DbMessageRow {
   return (
@@ -38,17 +44,21 @@ function isDbMessageRow(value: any): value is DbMessageRow {
     typeof value.user_id === "string" &&
     typeof value.name === "string" &&
     typeof value.message === "string" &&
-    typeof value.created_at === "string"
+    typeof value.created_at === "string" &&
+    (value.session_id === undefined || value.session_id === null || typeof value.session_id === "string") &&
+    (value.scope === undefined || value.scope === null || typeof value.scope === "string")
   );
 }
 
 export default function DebugMessagesScreen() {
-  const supabaseRef = useRef<SupabaseClient | null>(null);
   const realtimeChannelRef = useRef<RealtimeChannel | null>(null);
 
   const [authStatus, setAuthStatus] = useState<AuthStatus>("idle");
   const [authUserId, setAuthUserId] = useState<string>("");
   const [authError, setAuthError] = useState<string>("");
+
+  const [sessionId, setSessionId] = useState<string>("");
+  const sessionIdRef = useRef<string>("");
 
   const [name, setName] = useState<string>("Ken");
   const [message, setMessage] = useState<string>("Hello from my device");
@@ -58,6 +68,27 @@ export default function DebugMessagesScreen() {
   const [lastActionError, setLastActionError] = useState<string>("");
 
   const [realtimeStatus, setRealtimeStatus] = useState<string>("idle");
+
+  useEffect(() => {
+    let alive = true;
+
+    async function initSessionId() {
+      try {
+        const id = await getOrCreateSessionId();
+        if (!alive) return;
+        sessionIdRef.current = id;
+        setSessionId(id);
+      } catch {
+        // ignore
+      }
+    }
+
+    void initSessionId();
+
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const canInsert = useMemo(() => {
     return (
@@ -84,23 +115,6 @@ export default function DebugMessagesScreen() {
       setRealtimeStatus("idle");
 
       try {
-        const { url, anonKey } = getSupabaseEnv();
-        if (!url || !anonKey) {
-          throw new Error("Missing env vars: EXPO_PUBLIC_SUPABASE_URL / EXPO_PUBLIC_SUPABASE_ANON_KEY");
-        }
-
-        if (!supabaseRef.current) {
-          supabaseRef.current = createClient(url, anonKey, {
-            auth: {
-              persistSession: true,
-              autoRefreshToken: true,
-              detectSessionInUrl: false,
-            },
-          });
-        }
-
-        const supabase = supabaseRef.current;
-
         const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
         if (sessionError) throw sessionError;
 
@@ -127,7 +141,7 @@ export default function DebugMessagesScreen() {
       }
     }
 
-    initAnonAuth();
+    void initAnonAuth();
 
     return () => {
       alive = false;
@@ -135,18 +149,17 @@ export default function DebugMessagesScreen() {
   }, []);
 
   async function selectMyMessages() {
-    if (!supabaseRef.current || !authUserId) return;
+    if (!authUserId) return;
 
     setBusy(true);
     setLastActionError("");
 
     try {
-      const supabase = supabaseRef.current;
-
       const { data, error } = await supabase
         .from("messages")
-        .select("id, user_id, name, message, created_at")
+        .select("id, user_id, name, message, created_at, session_id, scope")
         .eq("user_id", authUserId)
+        .eq("scope", MESSAGE_SCOPE)
         .order("created_at", { ascending: false })
         .limit(30);
 
@@ -161,7 +174,7 @@ export default function DebugMessagesScreen() {
   }
 
   async function insertMessage() {
-    if (!supabaseRef.current || !authUserId) return;
+    if (!authUserId) return;
 
     const safeName = name.trim();
     const safeMessage = message.trim();
@@ -171,12 +184,16 @@ export default function DebugMessagesScreen() {
     setLastActionError("");
 
     try {
-      const supabase = supabaseRef.current;
+      const sid = sessionIdRef.current || sessionId || (await getOrCreateSessionId());
+      sessionIdRef.current = sid;
+      if (!sessionId) setSessionId(sid);
 
       const { error } = await supabase.from("messages").insert({
         user_id: authUserId,
         name: safeName,
         message: safeMessage,
+        session_id: sid,
+        scope: MESSAGE_SCOPE,
       });
 
       if (error) throw error;
@@ -189,19 +206,15 @@ export default function DebugMessagesScreen() {
     }
   }
 
-  // Initial SELECT when auth is ready (one-time load of existing rows)
   useEffect(() => {
     if (authStatus !== "ready") return;
     void selectMyMessages();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authStatus]);
 
-  // Step 9: Realtime subscribe to INSERT (my user_id only)
   useEffect(() => {
     if (authStatus !== "ready") return;
-    if (!supabaseRef.current || !authUserId) return;
-
-    const supabase = supabaseRef.current;
+    if (!authUserId) return;
 
     // Safety: ensure we don't keep multiple channels alive (double inserts)
     if (realtimeChannelRef.current) {
@@ -216,7 +229,7 @@ export default function DebugMessagesScreen() {
     setRealtimeStatus("subscribing");
 
     const channel = supabase
-      .channel(`debug-messages-inserts:${authUserId}`)
+      .channel(`debug-messages-inserts:${authUserId}:${MESSAGE_SCOPE}`)
       .on(
         "postgres_changes",
         {
@@ -228,6 +241,9 @@ export default function DebugMessagesScreen() {
         (payload: any) => {
           const next = payload?.new;
           if (!isDbMessageRow(next)) return;
+
+          const nextScope = typeof next.scope === "string" && next.scope ? next.scope : "";
+          if (nextScope !== MESSAGE_SCOPE) return;
 
           setRows((prev) => {
             if (prev.some((r) => r.id === next.id)) return prev;
@@ -264,23 +280,6 @@ export default function DebugMessagesScreen() {
     setRealtimeStatus("idle");
 
     try {
-      const { url, anonKey } = getSupabaseEnv();
-      if (!url || !anonKey) {
-        throw new Error("Missing env vars: EXPO_PUBLIC_SUPABASE_URL / EXPO_PUBLIC_SUPABASE_ANON_KEY");
-      }
-
-      if (!supabaseRef.current) {
-        supabaseRef.current = createClient(url, anonKey, {
-          auth: {
-            persistSession: true,
-            autoRefreshToken: true,
-            detectSessionInUrl: false,
-          },
-        });
-      }
-
-      const supabase = supabaseRef.current;
-
       // Cleanup any existing realtime channel before re-auth
       if (realtimeChannelRef.current) {
         try {
@@ -343,6 +342,20 @@ export default function DebugMessagesScreen() {
               </Text>
 
               <View style={{ height: 8 }} />
+
+              <Text style={styles.label}>Session ID (persisted)</Text>
+              <Text style={styles.sessionIdText} numberOfLines={1}>
+                {sessionId || "loading..."}
+              </Text>
+
+              <View style={{ height: 8 }} />
+
+              <Text style={styles.label}>Scope (fixed)</Text>
+              <Text style={styles.sessionIdText} numberOfLines={1}>
+                {MESSAGE_SCOPE}
+              </Text>
+
+              <View style={{ height: 8 }} />
               <View style={styles.rowBetween}>
                 <Text style={styles.label}>Realtime</Text>
                 <Text style={styles.mutedSmall}>{realtimeStatus}</Text>
@@ -358,7 +371,19 @@ export default function DebugMessagesScreen() {
               </Text>
             </>
           ) : (
-            <Text style={styles.mutedSmall}>Initializing anonymous session…</Text>
+            <>
+              <Text style={styles.mutedSmall}>Initializing anonymous session…</Text>
+              <View style={{ height: 6 }} />
+              <Text style={styles.label}>Session ID (persisted)</Text>
+              <Text style={styles.sessionIdText} numberOfLines={1}>
+                {sessionId || "loading..."}
+              </Text>
+              <View style={{ height: 8 }} />
+              <Text style={styles.label}>Scope (fixed)</Text>
+              <Text style={styles.sessionIdText} numberOfLines={1}>
+                {MESSAGE_SCOPE}
+              </Text>
+            </>
           )}
 
           <TouchableOpacity
@@ -442,6 +467,21 @@ export default function DebugMessagesScreen() {
                   <Text style={styles.mutedSmall}>{new Date(r.created_at).toLocaleString()}</Text>
                 </View>
                 <Text style={styles.rowMessage}>{r.message}</Text>
+
+                {r.session_id ? (
+                  <Text style={styles.mutedTiny} numberOfLines={1}>
+                    session: {r.session_id}
+                  </Text>
+                ) : (
+                  <Text style={styles.mutedTiny} numberOfLines={1}>
+                    session: (null)
+                  </Text>
+                )}
+
+                <Text style={styles.mutedTiny} numberOfLines={1}>
+                  scope: {typeof r.scope === "string" && r.scope ? r.scope : "(null)"}
+                </Text>
+
                 <Text style={styles.mutedTiny} numberOfLines={1}>
                   id: {r.id}
                 </Text>
@@ -528,6 +568,11 @@ const styles = StyleSheet.create({
     color: "rgba(255,255,255,0.45)",
     fontSize: 10,
     fontWeight: "700",
+  },
+  sessionIdText: {
+    color: "rgba(255,255,255,0.9)",
+    fontSize: 11,
+    fontWeight: "900",
   },
   errorText: {
     color: "rgba(255,120,120,0.95)",
@@ -625,4 +670,3 @@ const styles = StyleSheet.create({
     lineHeight: 16,
   },
 });
-

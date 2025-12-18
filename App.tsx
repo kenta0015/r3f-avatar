@@ -1,75 +1,40 @@
-// FILE: App.tsx
 import "react-native-gesture-handler";
 import "@expo/metro-runtime";
-import DebugMessagesScreen from "./DebugMessagesScreen";
 
 import React, { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
-  StyleSheet,
-  View,
-  Text,
-  TouchableOpacity,
-  SafeAreaView,
-  TextInput,
-  ScrollView,
+  ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
+  SafeAreaView,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from "react-native";
 
 import { NavigationContainer } from "@react-navigation/native";
 import { createNativeStackNavigator, type NativeStackScreenProps } from "@react-navigation/native-stack";
 
-import { Canvas, useFrame } from "@react-three/fiber";
-import { useGLTF } from "@react-three/drei/native";
-import { Asset } from "expo-asset";
+import { Canvas } from "@react-three/fiber";
 import { Audio } from "expo-av";
-import type { GLTF } from "three-stdlib";
 
-import { createClient, type SupabaseClient, type RealtimeChannel } from "@supabase/supabase-js";
+import DebugMessagesScreen from "./DebugMessagesScreen";
+import { supabase } from "./supabaseClient";
 
-const _log = console.log.bind(console);
-console.log = (...args: any[]) => {
-  const msg = String(args?.[0] ?? "");
-  if (msg.includes("EXGL: gl.pixelStorei() doesn't support this parameter yet!")) return;
-  _log(...args);
-};
+import { ensureAvatarPreloaded } from "./src/avatar/avatarPreload";
+import { installPollyFetchLogger } from "./src/debug/installPollyFetchLogger";
+import { ensureTtsCacheInit, getPlayableTtsUriForText } from "./src/tts/ttsCache";
 
-if (!globalThis.__FETCH_LOGGER_INSTALLED__) {
-  globalThis.__FETCH_LOGGER_INSTALLED__ = true;
+import { AvatarModel } from "./src/three/components/AvatarModel";
+import { Floor, LoadingFallback, RotatingBox } from "./src/three/components/SceneParts";
 
-  const originalFetch = globalThis.fetch.bind(globalThis);
-  const POLLY_BASE = (process.env.EXPO_PUBLIC_POLLY_URL || "").trim();
+import { subscribeMyMessageInserts, type RealtimeSubscriptionHandle } from "./src/supabase/realtimeMessages";
+import { ensureAnonUserId } from "./src/supabase/anonAuth";
 
-  globalThis.fetch = async (input: any, init?: any) => {
-    const method = (init?.method || "GET").toUpperCase();
-    const url = typeof input === "string" ? input : input?.url ? input.url : String(input);
-
-    const isPolly = POLLY_BASE ? url.startsWith(POLLY_BASE) : url.includes("lambda-url");
-    if (!isPolly) return originalFetch(input, init);
-
-    const safeUrl = url.replace(/text=[^&]*/i, "text=<omitted>");
-
-    console.log("\n=== POLLY REQUEST ===");
-    console.log("[POLLY]", method, safeUrl);
-
-    try {
-      const res = await originalFetch(input, init);
-      console.log("[POLLY]", "status", res.status);
-      console.log("[POLLY]", "content-type", res.headers.get("content-type"));
-      console.log(
-        "[POLLY]",
-        "isBase64",
-        res.headers.get("content-type")?.includes("audio/") ? "audio" : "non-audio"
-      );
-      console.log("=====================\n");
-      return res;
-    } catch (e: any) {
-      console.log("[POLLY]", "ERROR", e?.message || String(e));
-      console.log("=====================\n");
-      throw e;
-    }
-  };
-}
+import { getOrCreateSessionId } from "./src/session/sessionId";
 
 type RootStackParamList = {
   Landing: undefined;
@@ -82,9 +47,20 @@ const Stack = createNativeStackNavigator<RootStackParamList>();
 type LandingProps = NativeStackScreenProps<RootStackParamList, "Landing">;
 type ExperienceProps = NativeStackScreenProps<RootStackParamList, "Experience">;
 
-const POLLY_LAMBDA_BASE_URL =
-  (process.env.EXPO_PUBLIC_POLLY_URL || "").trim() ||
-  "https://xlt57x5dyt6ymnc7waumag2ywy0vluso.lambda-url.us-east-1.on.aws/";
+const _log = console.log.bind(console);
+console.log = (...args: any[]) => {
+  const msg = String(args?.[0] ?? "");
+  if (msg.includes("EXGL: gl.pixelStorei() doesn't support this parameter yet!")) return;
+  _log(...args);
+};
+
+installPollyFetchLogger();
+
+function nowMs() {
+  const p: any = (globalThis as any).performance;
+  if (p && typeof p.now === "function") return p.now();
+  return Date.now();
+}
 
 type MessageLog = {
   id: string;
@@ -98,115 +74,129 @@ type MessageLog = {
 
 type AuthStatus = "idle" | "loading" | "ready" | "error";
 
-type DbMessageRow = {
+function makeId() {
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+// Step 11-2(B): fixed scope (string) to isolate this app's rows/policies.
+// You can override via .env: EXPO_PUBLIC_MESSAGE_SCOPE=...
+const MESSAGE_SCOPE: string =
+  (process.env as any)?.EXPO_PUBLIC_MESSAGE_SCOPE ||
+  (process.env as any)?.EXPO_PUBLIC_MESSAGES_SCOPE ||
+  "r3f-avatar-mvp";
+
+type DbMessageRowCore = {
   id: string;
   user_id: string;
   name: string;
   message: string;
   created_at: string;
+  session_id?: string | null;
+  scope?: string | null;
 };
 
-function isDbMessageRow(value: any): value is DbMessageRow {
-  return (
-    value &&
-    typeof value === "object" &&
-    typeof value.id === "string" &&
-    typeof value.user_id === "string" &&
-    typeof value.name === "string" &&
-    typeof value.message === "string" &&
-    typeof value.created_at === "string"
-  );
+async function selectMyMessagesScoped(client: typeof supabase, userId: string, limit: number) {
+  const { data, error } = await client
+    .from("messages")
+    .select("id, user_id, name, message, created_at, session_id, scope")
+    .eq("user_id", userId)
+    .eq("scope", MESSAGE_SCOPE)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) throw error;
+  return (data as DbMessageRowCore[]) ?? [];
 }
 
-function makeId() {
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-function RotatingBox(props: any) {
-  const mesh = useRef<any>(null);
-  const [hovered, setHover] = useState(false);
-  const [active, setActive] = useState(false);
-
-  useFrame(() => {
-    if (mesh?.current) {
-      mesh.current.rotation.x += 0.01;
-      mesh.current.rotation.y += 0.01;
-    }
+async function insertMessageScoped(
+  client: typeof supabase,
+  userId: string,
+  name: string,
+  message: string,
+  sessionId: string
+) {
+  const { error } = await client.from("messages").insert({
+    user_id: userId,
+    name,
+    message,
+    session_id: sessionId,
+    scope: MESSAGE_SCOPE,
   });
 
-  return (
-    <mesh
-      {...props}
-      ref={mesh}
-      scale={active ? [1.5, 1.5, 1.5] : [1, 1, 1]}
-      onClick={() => setActive((v) => !v)}
-      onPointerOver={() => setHover(true)}
-      onPointerOut={() => setHover(false)}
-    >
-      <boxGeometry args={[1, 1, 1]} />
-      <meshStandardMaterial color={hovered ? "hotpink" : "orange"} />
-    </mesh>
-  );
+  if (error) throw error;
 }
 
-function Floor() {
-  return (
-    <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -1.6, 0]} receiveShadow>
-      <planeGeometry args={[20, 20]} />
-      <meshStandardMaterial color="#1a1a1a" />
-    </mesh>
-  );
+function clamp01(v: number) {
+  if (!Number.isFinite(v)) return 0;
+  if (v < 0) return 0;
+  if (v > 1) return 1;
+  return v;
 }
 
-function LoadingFallback() {
-  return (
-    <mesh position={[0, 0, 0]}>
-      <boxGeometry args={[0.5, 0.5, 0.5]} />
-      <meshStandardMaterial color="orange" />
-    </mesh>
-  );
-}
+function visemeToJawOpen(viseme: any): number {
+  if (!viseme) return 0;
 
-function AvatarModel({ uri, mouthActive }: { uri: string; mouthActive: boolean }) {
-  const gltf = useGLTF(uri) as unknown as GLTF;
+  const s = String(viseme).trim().toLowerCase();
 
-  const targetsRef = useRef<{ influences: number[]; index: number }[]>([]);
+  // wawa-lipsync style: "viseme_aa", "viseme_pp", "viseme_dd", ...
+  if (s.startsWith("viseme_")) {
+    const v = s.slice("viseme_".length);
 
-  useEffect(() => {
-    const targets: { influences: number[]; index: number }[] = [];
+    // Silence / rest
+    if (v === "sil" || v === "rest" || v === "x") return 0.0;
 
-    gltf.scene.traverse((obj: any) => {
-      const dict = obj?.morphTargetDictionary;
-      const influences = obj?.morphTargetInfluences;
+    // Vowels (bigger)
+    if (v === "aa") return 0.7;
+    if (v === "o") return 0.65;
+    if (v === "u") return 0.65;
+    if (v === "e") return 0.6;
+    if (v === "i") return 0.6;
 
-      if (!dict || !influences || !Array.isArray(influences)) return;
+    // Consonants (smaller, but not zero)
+    if (v === "pp") return 0.28;
+    if (v === "ff") return 0.24;
+    if (v === "th") return 0.22;
+    if (v === "dd") return 0.22;
+    if (v === "kk") return 0.2;
+    if (v === "ch") return 0.2;
+    if (v === "ss") return 0.18;
+    if (v === "nn") return 0.18;
+    if (v === "rr") return 0.18;
 
-      const jawIndex = dict["jawOpen"] ?? dict["JawOpen"] ?? dict["mouthOpen"] ?? dict["MouthOpen"];
+    // Fallback: mid-low
+    return 0.26;
+  }
 
-      if (typeof jawIndex === "number") {
-        targets.push({ influences, index: jawIndex });
-      }
-    });
+  // Fallback mapping (non-wawa)
+  if (s.includes("sil") || s.includes("rest") || s === "x") return 0.02;
 
-    targetsRef.current = targets;
-  }, [gltf]);
+  if (s.includes("m") || s.includes("b") || s.includes("p")) return 0.18;
+  if (s.includes("f") || s.includes("v")) return 0.24;
 
-  useFrame((state) => {
-    const targets = targetsRef.current;
-    if (!targets.length) return;
+  if (s === "a" || s.includes("aa")) return 0.55;
+  if (s === "e" || s.includes("eh") || s.includes("ee")) return 0.4;
+  if (s === "i" || s.includes("ih") || s.includes("iy")) return 0.42;
+  if (s === "o" || s.includes("oh") || s.includes("ao")) return 0.5;
+  if (s === "u" || s.includes("uw") || s.includes("uh")) return 0.45;
 
-    const t = state.clock.getElapsedTime();
-    const v = mouthActive ? 0.35 + 0.35 * Math.sin(t * 12) : 0;
-
-    for (const trg of targets) {
-      trg.influences[trg.index] = v;
-    }
-  });
-
-  return <primitive object={gltf.scene} position={[0, -1.6, 0]} scale={[1, 1, 1]} />;
+  return 0.26;
 }
 
 function LandingScreen({ navigation }: LandingProps) {
+  useEffect(() => {
+    void ensureAvatarPreloaded("Landing").catch(() => {
+      // ignore
+    });
+
+    void ensureTtsCacheInit().catch(() => {
+      // ignore
+    });
+
+    void getOrCreateSessionId().catch(() => {
+      // ignore
+    });
+  }, []);
+
   return (
     <SafeAreaView style={styles.landingSafe}>
       <View style={styles.landingContainer}>
@@ -224,23 +214,18 @@ function LandingScreen({ navigation }: LandingProps) {
           <Text style={styles.primaryButtonText}>Enter Experience</Text>
         </TouchableOpacity>
 
-        <TouchableOpacity style={styles.primaryButton} onPress={() => navigation.navigate("DebugMessages")}>
-          <Text style={styles.primaryButtonText}>Open Debug Messages</Text>
+        <TouchableOpacity style={styles.debugButton} onPress={() => navigation.navigate("DebugMessages")}>
+          <Text style={styles.debugButtonText}>Open DebugMessagesScreen</Text>
         </TouchableOpacity>
       </View>
     </SafeAreaView>
   );
 }
 
-function getSupabaseEnv() {
-  const url = (process.env.EXPO_PUBLIC_SUPABASE_URL || "").trim();
-  const anonKey = (process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || "").trim();
-  return { url, anonKey };
-}
-
 function ExperienceScreen({ navigation }: ExperienceProps) {
   const [avatarUri, setAvatarUri] = useState<string | null>(null);
   const [avatarError, setAvatarError] = useState<string | null>(null);
+  const [avatarReady, setAvatarReady] = useState(false);
 
   const [name, setName] = useState("");
   const [message, setMessage] = useState("");
@@ -248,11 +233,12 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
   const [logs, setLogs] = useState<MessageLog[]>([]);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const [isDbLoading, setIsDbLoading] = useState(false);
 
   const soundRef = useRef<Audio.Sound | null>(null);
+  const lastWebBlobUrlRef = useRef<string | null>(null);
 
-  const supabaseRef = useRef<SupabaseClient | null>(null);
-  const realtimeChannelRef = useRef<RealtimeChannel | null>(null);
+  const realtimeSubRef = useRef<RealtimeSubscriptionHandle | null>(null);
 
   const [authStatus, setAuthStatus] = useState<AuthStatus>("idle");
   const [authUserId, setAuthUserId] = useState<string>("");
@@ -260,11 +246,79 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
 
   const [realtimeStatus, setRealtimeStatus] = useState<string>("idle");
 
+  const [sessionId, setSessionId] = useState<string>("");
+  const sessionIdRef = useRef<string>("");
+
   const pendingSpeakRef = useRef<{
     name: string;
     message: string;
     requestedAt: number;
+    sessionId: string;
   } | null>(null);
+
+  const experienceStartMsRef = useRef<number>(0);
+  const avatarUriReadyLoggedRef = useRef(false);
+
+  // Web-only lipsync (Wawa)
+  const [mouthValue, setMouthValue] = useState<number | undefined>(undefined);
+  const webAudioElRef = useRef<any>(null);
+  const webRafRef = useRef<number | null>(null);
+  const lipsyncRef = useRef<any>(null);
+  const lastVisemeRef = useRef<any>(null);
+  const mouthValueRef = useRef<number>(0);
+  const mouthStateSentRef = useRef<number>(0);
+
+  // Lipsync tuning (web)
+  const MOUTH_GAIN = 2.5;
+  const MOUTH_SMOOTH_ALPHA = 0.28;
+  const MOUTH_SETSTATE_EPS = 0.008;
+
+  const isAvatarLoading = !avatarError && (!avatarUri || !avatarReady);
+
+  useEffect(() => {
+    experienceStartMsRef.current = nowMs();
+    avatarUriReadyLoggedRef.current = false;
+    console.log("[PERF] Experience mounted");
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+
+    async function initSessionId() {
+      try {
+        const id = await getOrCreateSessionId();
+        if (!alive) return;
+        sessionIdRef.current = id;
+        setSessionId(id);
+      } catch {
+        // ignore
+      }
+    }
+
+    initSessionId();
+
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!avatarUri) {
+      setAvatarReady(false);
+      return;
+    }
+    setAvatarReady(false);
+  }, [avatarUri]);
+
+  useEffect(() => {
+    if (!avatarUri) return;
+
+    if (!avatarUriReadyLoggedRef.current) {
+      avatarUriReadyLoggedRef.current = true;
+      const ms = Math.round(nowMs() - experienceStartMsRef.current);
+      console.log(`[PERF] avatar uri ready in ${ms}ms`);
+    }
+  }, [avatarUri]);
 
   useEffect(() => {
     let mounted = true;
@@ -282,12 +336,7 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
 
     async function resolveLocalAvatar() {
       try {
-        const asset = Asset.fromModule(require("./assets/avatar.glb"));
-        await asset.downloadAsync();
-
-        const uri = asset.localUri || asset.uri;
-        if (!uri) throw new Error("Failed to resolve avatar URI from Expo Asset.");
-
+        const uri = await ensureAvatarPreloaded("Experience");
         if (mounted) setAvatarUri(uri);
       } catch (e: any) {
         if (mounted) setAvatarError(String(e?.message || e));
@@ -308,31 +357,200 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
         } catch {
           // ignore
         }
+
+        if (Platform.OS === "web") {
+          if (webRafRef.current) {
+            try {
+              cancelAnimationFrame(webRafRef.current);
+            } catch {
+              // ignore
+            }
+            webRafRef.current = null;
+          }
+
+          try {
+            if (webAudioElRef.current) {
+              try {
+                webAudioElRef.current.pause();
+              } catch {
+                // ignore
+              }
+              webAudioElRef.current.onended = null;
+              webAudioElRef.current.onerror = null;
+              webAudioElRef.current = null;
+            }
+          } catch {
+            // ignore
+          }
+
+          setMouthValue(0);
+          mouthValueRef.current = 0;
+          mouthStateSentRef.current = 0;
+          lastVisemeRef.current = null;
+
+          if (lastWebBlobUrlRef.current) {
+            try {
+              URL.revokeObjectURL(lastWebBlobUrlRef.current);
+            } catch {
+              // ignore
+            }
+            lastWebBlobUrlRef.current = null;
+          }
+        }
       })();
     };
   }, []);
-
-  function buildTtsUrl(text: string) {
-    const u = new URL(POLLY_LAMBDA_BASE_URL);
-    u.searchParams.set("text", text);
-    u.searchParams.set("voiceId", "Joanna");
-    u.searchParams.set("format", "mp3");
-    u.searchParams.set("engine", "neural");
-    u.searchParams.set("tone", "healing");
-    const built = u.toString();
-    console.log("[POLLY] URL", built.replace(/text=[^&]*/i, "text=<omitted>"));
-    return u.toString();
-  }
 
   function setLogStatus(id: string, next: Partial<MessageLog>) {
     setLogs((prev) => prev.map((l) => (l.id === id ? { ...l, ...next } : l)));
   }
 
-  async function playTtsForLog(logId: string, ttsUrl: string) {
-    setIsSpeaking(true);
-    setLogStatus(logId, { status: "loading", ttsUrl });
+  function stopWebLipsync() {
+    if (Platform.OS !== "web") return;
+
+    if (webRafRef.current) {
+      try {
+        cancelAnimationFrame(webRafRef.current);
+      } catch {
+        // ignore
+      }
+      webRafRef.current = null;
+    }
+
+    lastVisemeRef.current = null;
+    mouthValueRef.current = 0;
+    mouthStateSentRef.current = 0;
+    setMouthValue(0);
+  }
+
+  async function ensureWebLipsyncManager() {
+    if (Platform.OS !== "web") return null;
+    if (lipsyncRef.current) return lipsyncRef.current;
+
+    const mod: any = await import("wawa-lipsync");
+    const LipsyncCtor = mod?.Lipsync;
+    if (!LipsyncCtor) throw new Error("wawa-lipsync: Lipsync export not found");
+
+    lipsyncRef.current = new LipsyncCtor();
+    return lipsyncRef.current;
+  }
+
+  async function playWebTtsWithLipsync(logId: string, uri: string) {
+    stopWebLipsync();
+
+    const lipsync = await ensureWebLipsyncManager();
+
+    // Stop any existing web audio
+    try {
+      if (webAudioElRef.current) {
+        try {
+          webAudioElRef.current.pause();
+        } catch {
+          // ignore
+        }
+        webAudioElRef.current.onended = null;
+        webAudioElRef.current.onerror = null;
+      }
+    } catch {
+      // ignore
+    }
+
+    const AudioCtor: any = (globalThis as any).Audio;
+    if (!AudioCtor) throw new Error("Web Audio element not available");
+
+    const audioEl: any = webAudioElRef.current || new AudioCtor();
+    webAudioElRef.current = audioEl;
+
+    // Important: src must be set BEFORE connectAudio()
+    audioEl.preload = "auto";
+    audioEl.crossOrigin = "anonymous";
+    audioEl.src = uri;
 
     try {
+      lipsync.connectAudio(audioEl);
+    } catch (e: any) {
+      throw new Error(`wawa-lipsync connectAudio failed: ${String(e?.message || e)}`);
+    }
+
+    // Start analyzer loop (logs viseme changes; updates mouthValue with smoothing)
+    const analyze = () => {
+      webRafRef.current = requestAnimationFrame(analyze);
+
+      try {
+        lipsync.processAudio();
+        const viseme = lipsync.viseme;
+
+        if (viseme !== lastVisemeRef.current) {
+          lastVisemeRef.current = viseme;
+          console.log("[LIPSYNC] viseme:", viseme);
+        }
+
+        const raw = visemeToJawOpen(viseme);
+        const target = clamp01(raw * MOUTH_GAIN);
+
+        const prev = mouthValueRef.current;
+        const smoothed = prev + (target - prev) * MOUTH_SMOOTH_ALPHA;
+
+        mouthValueRef.current = smoothed;
+
+        if (Math.abs(smoothed - mouthStateSentRef.current) > MOUTH_SETSTATE_EPS) {
+          mouthStateSentRef.current = smoothed;
+          setMouthValue(smoothed);
+        }
+      } catch {
+        // ignore (keep the loop alive)
+      }
+    };
+
+    analyze();
+
+    audioEl.onended = () => {
+      stopWebLipsync();
+      setIsSpeaking(false);
+      setLogStatus(logId, { status: "ready" });
+
+      if (lastWebBlobUrlRef.current) {
+        try {
+          URL.revokeObjectURL(lastWebBlobUrlRef.current);
+        } catch {
+          // ignore
+        }
+        lastWebBlobUrlRef.current = null;
+      }
+    };
+
+    audioEl.onerror = () => {
+      stopWebLipsync();
+      setIsSpeaking(false);
+      setLogStatus(logId, { status: "error", errorMessage: "Web audio playback error" });
+
+      if (lastWebBlobUrlRef.current) {
+        try {
+          URL.revokeObjectURL(lastWebBlobUrlRef.current);
+        } catch {
+          // ignore
+        }
+        lastWebBlobUrlRef.current = null;
+      }
+    };
+
+    // Play (user gesture from Speak button should allow this)
+    await audioEl.play();
+  }
+
+  async function playTtsForLog(logId: string, text: string) {
+    setIsSpeaking(true);
+    setLogStatus(logId, { status: "loading", ttsUrl: "" });
+
+    // Web: reset mouthValue immediately
+    if (Platform.OS === "web") {
+      mouthValueRef.current = 0;
+      mouthStateSentRef.current = 0;
+      setMouthValue(0);
+    }
+
+    try {
+      // Stop/unload expo-av sound (native path)
       if (soundRef.current) {
         try {
           await soundRef.current.unloadAsync();
@@ -342,20 +560,36 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
         soundRef.current = null;
       }
 
-      {
-        const safeUrl = ttsUrl.replace(/text=[^&]*/i, "text=<omitted>");
-        console.log("[POLLY] preflight GET", safeUrl);
-
-        const res = await fetch(ttsUrl, { method: "GET" });
-        console.log("[POLLY] preflight status", res.status);
-
-        if (!res.ok) {
-          throw new Error(`Polly/Lambda request failed: HTTP ${res.status}`);
+      // Revoke previous blob (web path)
+      if (Platform.OS === "web" && lastWebBlobUrlRef.current) {
+        try {
+          URL.revokeObjectURL(lastWebBlobUrlRef.current);
+        } catch {
+          // ignore
         }
+        lastWebBlobUrlRef.current = null;
       }
 
+      const startedAt = nowMs();
+      const playable = await getPlayableTtsUriForText(text);
+      const ms = Math.round(nowMs() - startedAt);
+      console.log(`[PERF] TTS playable uri ready in ${ms}ms (${playable.source})`);
+
+      if (Platform.OS === "web" && playable.uri.startsWith("blob:")) {
+        lastWebBlobUrlRef.current = playable.uri;
+      }
+
+      setLogStatus(logId, { ttsUrl: playable.uri });
+
+      if (Platform.OS === "web") {
+        setLogStatus(logId, { status: "playing" });
+        await playWebTtsWithLipsync(logId, playable.uri);
+        return;
+      }
+
+      // Native: keep existing expo-av flow
       const { sound } = await Audio.Sound.createAsync(
-        { uri: ttsUrl },
+        { uri: playable.uri },
         { shouldPlay: true, volume: 1.0 },
         (status) => {
           if (!status.isLoaded) return;
@@ -374,6 +608,9 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
       soundRef.current = sound;
       setLogStatus(logId, { status: "playing" });
     } catch (e: any) {
+      if (Platform.OS === "web") {
+        stopWebLipsync();
+      }
       setIsSpeaking(false);
       setLogStatus(logId, { status: "error", errorMessage: String(e?.message || e) });
     }
@@ -389,39 +626,7 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
       setRealtimeStatus("idle");
 
       try {
-        const { url, anonKey } = getSupabaseEnv();
-
-        if (!url || !anonKey) {
-          throw new Error("Missing Supabase env vars. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.");
-        }
-
-        if (!supabaseRef.current) {
-          supabaseRef.current = createClient(url, anonKey, {
-            auth: {
-              persistSession: true,
-              autoRefreshToken: true,
-              detectSessionInUrl: false,
-            },
-          });
-        }
-
-        const supabase = supabaseRef.current;
-
-        const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
-        if (sessionError) throw sessionError;
-
-        let userId = sessionData?.session?.user?.id || "";
-
-        if (!userId) {
-          const { data, error } = await supabase.auth.signInAnonymously();
-          if (error) throw error;
-          userId = data?.user?.id || data?.session?.user?.id || "";
-        }
-
-        if (!userId) {
-          throw new Error("Anonymous sign-in did not return a user id.");
-        }
-
+        const { userId } = await ensureAnonUserId(supabase);
         if (!alive) return;
 
         setAuthUserId(userId);
@@ -440,27 +645,19 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
     };
   }, []);
 
-  async function selectMyMessages() {
-    if (!supabaseRef.current || !authUserId) return;
+  async function refreshMessages() {
+    if (!authUserId) return;
 
+    setIsDbLoading(true);
     try {
-      const supabase = supabaseRef.current;
-
-      const { data, error } = await supabase
-        .from("messages")
-        .select("id, user_id, name, message, created_at")
-        .eq("user_id", authUserId)
-        .order("created_at", { ascending: false })
-        .limit(30);
-
-      if (error) return;
+      const rows = await selectMyMessagesScoped(supabase, authUserId, 30);
 
       const mapped: MessageLog[] =
-        (data as any[])?.map((row: any) => ({
-          id: String(row?.id || makeId()),
-          name: String(row?.name || ""),
-          message: String(row?.message || ""),
-          createdAt: row?.created_at ? new Date(row.created_at).getTime() : Date.now(),
+        (rows ?? []).map((row: any) => ({
+          id: typeof row?.id === "string" && row.id ? row.id : makeId(),
+          name: typeof row?.name === "string" ? row.name : String(row?.name ?? ""),
+          message: typeof row?.message === "string" ? row.message : String(row?.message ?? ""),
+          createdAt: typeof row?.created_at === "string" ? new Date(row.created_at).getTime() : Date.now(),
           ttsUrl: "",
           status: "ready",
         })) ?? [];
@@ -468,104 +665,86 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
       setLogs(mapped);
     } catch {
       // ignore
+    } finally {
+      setIsDbLoading(false);
     }
-  }
-
-  async function insertMessageToDb(safeName: string, safeMessage: string) {
-    if (!supabaseRef.current) throw new Error("Supabase client not ready");
-    if (!authUserId) throw new Error("authUserId missing");
-
-    const supabase = supabaseRef.current;
-    const { error } = await supabase.from("messages").insert({
-      user_id: authUserId,
-      name: safeName,
-      message: safeMessage,
-    });
-
-    if (error) throw error;
   }
 
   useEffect(() => {
     if (authStatus !== "ready") return;
-    if (!supabaseRef.current || !authUserId) return;
-    void selectMyMessages();
+    if (!authUserId) return;
+    void refreshMessages();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authStatus, authUserId]);
 
   useEffect(() => {
     if (authStatus !== "ready") return;
-    if (!supabaseRef.current || !authUserId) return;
+    if (!authUserId) return;
 
-    const supabase = supabaseRef.current;
-
-    if (realtimeChannelRef.current) {
+    if (realtimeSubRef.current) {
       try {
-        supabase.removeChannel(realtimeChannelRef.current);
+        realtimeSubRef.current.unsubscribe();
       } catch {
         // ignore
       }
-      realtimeChannelRef.current = null;
+      realtimeSubRef.current = null;
     }
 
     setRealtimeStatus("subscribing");
 
-    const channel = supabase
-      .channel(`experience-messages-inserts:${authUserId}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "messages",
-          filter: `user_id=eq.${authUserId}`,
-        },
-        (payload: any) => {
-          const next = payload?.new;
-          if (!isDbMessageRow(next)) return;
+    const sub = subscribeMyMessageInserts({
+      client: supabase,
+      userId: authUserId,
+      onStatus: (s) => setRealtimeStatus(s),
+      onError: () => setRealtimeStatus("error"),
+      onInsert: (next: any) => {
+        const nextScope = typeof next?.scope === "string" && next.scope ? next.scope : "";
+        if (nextScope && nextScope !== MESSAGE_SCOPE) return;
 
-          const nextLog: MessageLog = {
-            id: next.id,
-            name: next.name,
-            message: next.message,
-            createdAt: new Date(next.created_at).getTime(),
-            ttsUrl: "",
-            status: "ready",
-          };
+        const nextLog: MessageLog = {
+          id: String(next.id),
+          name: String(next.name ?? ""),
+          message: String(next.message ?? ""),
+          createdAt: typeof next?.created_at === "string" ? new Date(next.created_at).getTime() : Date.now(),
+          ttsUrl: "",
+          status: "ready",
+        };
 
-          setLogs((prev) => {
-            if (prev.some((r) => r.id === nextLog.id)) return prev;
-            const merged = [nextLog, ...prev];
-            return merged.slice(0, 30);
-          });
+        setLogs((prev) => {
+          if (prev.some((r) => r.id === nextLog.id)) return prev;
+          const merged = [nextLog, ...prev];
+          return merged.slice(0, 30);
+        });
 
-          const pending = pendingSpeakRef.current;
-          if (!pending) return;
+        const pending = pendingSpeakRef.current;
+        if (!pending) return;
 
-          const ageMs = Date.now() - pending.requestedAt;
-          const same = pending.name.trim() === next.name.trim() && pending.message.trim() === next.message.trim();
+        const ageMs = Date.now() - pending.requestedAt;
+        const sameText =
+          pending.name.trim() === String(next.name ?? "").trim() &&
+          pending.message.trim() === String(next.message ?? "").trim();
 
-          if (same && ageMs >= 0 && ageMs < 15_000) {
-            pendingSpeakRef.current = null;
-            const ttsUrl = buildTtsUrl(next.message);
-            void playTtsForLog(next.id, ttsUrl);
-            setIsSending(false);
-          }
+        const nextSessionId = typeof next?.session_id === "string" && next.session_id ? next.session_id : "";
+        const sameSession = !!pending.sessionId && !!nextSessionId && pending.sessionId === nextSessionId;
+
+        if (sameSession && sameText && ageMs >= 0 && ageMs < 15_000) {
+          pendingSpeakRef.current = null;
+          void playTtsForLog(String(next.id), String(next.message ?? ""));
+          setIsSending(false);
         }
-      )
-      .subscribe((status: any) => {
-        setRealtimeStatus(String(status || "unknown"));
-      });
+      },
+    });
 
-    realtimeChannelRef.current = channel;
+    realtimeSubRef.current = sub;
 
     return () => {
-      if (realtimeChannelRef.current) {
+      if (realtimeSubRef.current) {
         try {
-          supabase.removeChannel(realtimeChannelRef.current);
+          realtimeSubRef.current.unsubscribe();
         } catch {
           // ignore
         }
-        realtimeChannelRef.current = null;
+        realtimeSubRef.current = null;
       }
       setRealtimeStatus("idle");
     };
@@ -576,35 +755,36 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
     const safeMessage = message.trim();
 
     if (!safeName || !safeMessage) return;
-    if (authStatus !== "ready" || !authUserId || !supabaseRef.current) return;
-    if (isSending || isSpeaking) return;
+    if (authStatus !== "ready" || !authUserId) return;
+    if (isSending || isSpeaking || isDbLoading || isAvatarLoading) return;
 
     setIsSending(true);
 
     try {
+      const sid = sessionIdRef.current || sessionId || (await getOrCreateSessionId());
+      sessionIdRef.current = sid;
+      if (!sessionId) setSessionId(sid);
+
       pendingSpeakRef.current = {
         name: safeName,
         message: safeMessage,
         requestedAt: Date.now(),
+        sessionId: sid,
       };
 
-      await insertMessageToDb(safeName, safeMessage);
-
-      // Step9: No reload. The Realtime INSERT handler will add the row and trigger audio playback.
-      // If Realtime fails, user can still see rows via initial SELECT and retry auth if needed.
+      await insertMessageScoped(supabase, authUserId, safeName, safeMessage, sid);
     } catch (e: any) {
       pendingSpeakRef.current = null;
       setIsSending(false);
 
       const id = makeId();
-      const ttsUrl = buildTtsUrl(safeMessage);
 
       const errorLog: MessageLog = {
         id,
         name: safeName,
         message: safeMessage,
         createdAt: Date.now(),
-        ttsUrl,
+        ttsUrl: "",
         status: "error",
         errorMessage: String(e?.message || e),
       };
@@ -622,47 +802,23 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
     pendingSpeakRef.current = null;
     setIsSending(false);
     setIsSpeaking(false);
+    setIsDbLoading(false);
+
+    if (Platform.OS === "web") {
+      stopWebLipsync();
+    }
 
     try {
-      const { url, anonKey } = getSupabaseEnv();
-
-      if (!url || !anonKey) {
-        throw new Error("Missing Supabase env vars. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.");
-      }
-
-      if (!supabaseRef.current) {
-        supabaseRef.current = createClient(url, anonKey, {
-          auth: {
-            persistSession: true,
-            autoRefreshToken: true,
-            detectSessionInUrl: false,
-          },
-        });
-      }
-
-      const supabase = supabaseRef.current;
-
-      if (realtimeChannelRef.current) {
+      if (realtimeSubRef.current) {
         try {
-          supabase.removeChannel(realtimeChannelRef.current);
+          realtimeSubRef.current.unsubscribe();
         } catch {
           // ignore
         }
-        realtimeChannelRef.current = null;
+        realtimeSubRef.current = null;
       }
 
-      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
-      if (sessionError) throw sessionError;
-
-      let userId = sessionData?.session?.user?.id || "";
-
-      if (!userId) {
-        const { data, error } = await supabase.auth.signInAnonymously();
-        if (error) throw error;
-        userId = data?.user?.id || data?.session?.user?.id || "";
-      }
-
-      if (!userId) throw new Error("Anonymous sign-in did not return a user id.");
+      const { userId } = await ensureAnonUserId(supabase);
 
       setAuthUserId(userId);
       setAuthStatus("ready");
@@ -686,7 +842,23 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
     name.trim().length > 0 &&
     message.trim().length > 0 &&
     !isSpeaking &&
-    !isSending;
+    !isSending &&
+    !isDbLoading &&
+    !isAvatarLoading;
+
+  const showOverlay = isAvatarLoading || isSending || isSpeaking;
+
+  const overlayTitle = isAvatarLoading ? "Loading avatar…" : isSending ? "Sending…" : isSpeaking ? "Speaking…" : "";
+
+  const overlayHint = isAvatarLoading
+    ? "Preparing 3D model and materials"
+    : isSending
+    ? "Writing to Supabase"
+    : isSpeaking
+    ? Platform.OS === "web"
+      ? "Playing audio + lipsync (web)"
+      : "Playing audio (cached)"
+    : "";
 
   return (
     <KeyboardAvoidingView style={styles.experienceContainer} behavior={Platform.OS === "ios" ? "padding" : undefined}>
@@ -701,32 +873,63 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
       </View>
 
       <View style={styles.canvasWrap}>
-        <Canvas
-          camera={camera}
-          shadows
-          onCreated={({ camera }) => {
-            camera.lookAt(0, 0.0, 0);
-            camera.updateProjectionMatrix();
-          }}
-        >
-          <color attach="background" args={["#000000"]} />
+        <View style={styles.canvasContainer}>
+          <Canvas
+            camera={camera}
+            shadows
+            onCreated={({ camera }) => {
+              camera.lookAt(0, 0.0, 0);
+              camera.updateProjectionMatrix();
+            }}
+          >
+            <color attach="background" args={["#000000"]} />
 
-          <ambientLight intensity={0.6} />
-          <directionalLight position={[2, 4, 2]} intensity={1.2} castShadow />
-          <pointLight position={[0, 2, 4]} intensity={0.6} />
+            <ambientLight intensity={0.6} />
+            <directionalLight position={[2, 4, 2]} intensity={1.2} castShadow />
+            <pointLight position={[0, 2, 4]} intensity={0.6} />
 
-          <Floor />
+            <Floor />
 
-          <Suspense fallback={<LoadingFallback />}>
-            {avatarError ? (
-              <RotatingBox position={[0, 0, 0]} />
-            ) : avatarUri ? (
-              <AvatarModel uri={avatarUri} mouthActive={isSpeaking} />
+            <Suspense fallback={<LoadingFallback />}>
+              {avatarError ? (
+                <RotatingBox position={[0, 0, 0]} />
+              ) : avatarUri ? (
+                <AvatarModel
+                  uri={avatarUri}
+                  mouthActive={isSpeaking}
+                  mouthValue={Platform.OS === "web" ? mouthValue : undefined}
+                  onReady={() => {
+                    setAvatarReady(true);
+                    const ms = Math.round(nowMs() - experienceStartMsRef.current);
+                    console.log(`[PERF] avatar READY in ${ms}ms`);
+                  }}
+                />
+              ) : (
+                <LoadingFallback />
+              )}
+            </Suspense>
+          </Canvas>
+
+          {showOverlay ? (
+            Platform.OS === "web" ? (
+              <View style={[styles.canvasOverlay, { pointerEvents: "none" } as any]}>
+                <View style={styles.overlayCard}>
+                  <ActivityIndicator />
+                  <Text style={styles.overlayTitle}>{overlayTitle}</Text>
+                  <Text style={styles.overlayHint}>{overlayHint}</Text>
+                </View>
+              </View>
             ) : (
-              <LoadingFallback />
-            )}
-          </Suspense>
-        </Canvas>
+              <View style={styles.canvasOverlay} pointerEvents="none">
+                <View style={styles.overlayCard}>
+                  <ActivityIndicator />
+                  <Text style={styles.overlayTitle}>{overlayTitle}</Text>
+                  <Text style={styles.overlayHint}>{overlayHint}</Text>
+                </View>
+              </View>
+            )
+          ) : null}
+        </View>
       </View>
 
       <View style={styles.panel}>
@@ -752,6 +955,20 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
               </Text>
 
               <View style={{ height: 8 }} />
+
+              <Text style={styles.authLabel}>Session ID (persisted)</Text>
+              <Text style={styles.sessionIdText} numberOfLines={1}>
+                {sessionId || "loading..."}
+              </Text>
+
+              <View style={{ height: 8 }} />
+
+              <Text style={styles.authLabel}>Scope (fixed)</Text>
+              <Text style={styles.sessionIdText} numberOfLines={1}>
+                {MESSAGE_SCOPE}
+              </Text>
+
+              <View style={{ height: 8 }} />
               <View style={styles.authTopRow}>
                 <Text style={styles.authLabel}>Realtime</Text>
                 <Text style={styles.authStatus}>{realtimeStatus}</Text>
@@ -762,12 +979,22 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
               <Text style={styles.authErrorText} numberOfLines={3}>
                 {authError}
               </Text>
-              <Text style={styles.authHint}>
-                Tip: create a .env and add EXPO_PUBLIC_SUPABASE_URL / EXPO_PUBLIC_SUPABASE_ANON_KEY, then restart Metro.
-              </Text>
+              <Text style={styles.authHint}>Tip: check your Supabase settings, then restart Metro.</Text>
             </>
           ) : (
-            <Text style={styles.authHint}>Initializing anonymous session…</Text>
+            <>
+              <Text style={styles.authHint}>Initializing anonymous session…</Text>
+              <View style={{ height: 6 }} />
+              <Text style={styles.authLabel}>Session ID (persisted)</Text>
+              <Text style={styles.sessionIdText} numberOfLines={1}>
+                {sessionId || "loading..."}
+              </Text>
+              <View style={{ height: 8 }} />
+              <Text style={styles.authLabel}>Scope (fixed)</Text>
+              <Text style={styles.sessionIdText} numberOfLines={1}>
+                {MESSAGE_SCOPE}
+              </Text>
+            </>
           )}
 
           <TouchableOpacity
@@ -790,6 +1017,7 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
               style={styles.input}
               autoCapitalize="words"
               autoCorrect={false}
+              editable={authStatus === "ready" && !isAvatarLoading}
             />
           </View>
 
@@ -803,14 +1031,17 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
               style={styles.input}
               autoCapitalize="sentences"
               autoCorrect
+              editable={authStatus === "ready" && !isAvatarLoading}
             />
           </View>
         </View>
 
-        <TouchableOpacity style={[styles.speakButton, !canSpeak ? styles.speakButtonDisabled : null]} disabled={!canSpeak} onPress={speak}>
-          <Text style={styles.speakButtonText}>
-            {isSpeaking ? "Speaking..." : isSending ? "Sending..." : "Speak"}
-          </Text>
+        <TouchableOpacity
+          style={[styles.speakButton, !canSpeak ? styles.speakButtonDisabled : null]}
+          disabled={!canSpeak}
+          onPress={speak}
+        >
+          <Text style={styles.speakButtonText}>{isSpeaking ? "Speaking..." : isSending ? "Sending..." : "Speak"}</Text>
         </TouchableOpacity>
 
         <View style={styles.logsHeader}>
@@ -818,7 +1049,11 @@ function ExperienceScreen({ navigation }: ExperienceProps) {
           <Text style={styles.logsHint}>Insert triggers Realtime → card auto-add</Text>
         </View>
 
-        <ScrollView style={styles.logsList} contentContainerStyle={styles.logsContent}>
+        <ScrollView
+          style={styles.logsList}
+          contentContainerStyle={styles.logsContent}
+          scrollEnabled={Platform.OS !== "web"}
+        >
           {avatarError ? (
             <View style={styles.logCardError}>
               <Text style={styles.logCardTitle}>Avatar load failed</Text>
@@ -928,6 +1163,20 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: "700",
   },
+  debugButton: {
+    height: 44,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.14)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+  },
+  debugButtonText: {
+    color: "white",
+    fontSize: 13,
+    fontWeight: "800",
+  },
 
   experienceContainer: {
     flex: 1,
@@ -962,6 +1211,41 @@ const styles = StyleSheet.create({
   canvasWrap: {
     flex: 1,
   },
+  canvasContainer: {
+    flex: 1,
+  },
+  canvasOverlay: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    alignItems: "flex-end",
+    justifyContent: "flex-start",
+    paddingTop: 12,
+    paddingRight: 12,
+    paddingLeft: 12,
+  },
+  overlayCard: {
+    borderRadius: 16,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+    backgroundColor: "rgba(0,0,0,0.55)",
+    alignItems: "center",
+    gap: 8,
+  },
+  overlayTitle: {
+    color: "white",
+    fontSize: 14,
+    fontWeight: "900",
+  },
+  overlayHint: {
+    color: "rgba(255,255,255,0.65)",
+    fontSize: 12,
+    fontWeight: "700",
+  },
 
   panel: {
     paddingHorizontal: 14,
@@ -970,6 +1254,12 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: "rgba(255,255,255,0.1)",
     gap: 10,
+    ...(Platform.OS === "web"
+      ? ({
+          maxHeight: 260,
+          overflow: "auto",
+        } as any)
+      : ({} as any)),
   },
 
   authCard: {
@@ -1003,6 +1293,11 @@ const styles = StyleSheet.create({
   authUid: {
     color: "white",
     fontSize: 12,
+    fontWeight: "900",
+  },
+  sessionIdText: {
+    color: "rgba(255,255,255,0.9)",
+    fontSize: 11,
     fontWeight: "900",
   },
   authHint: {
@@ -1088,7 +1383,14 @@ const styles = StyleSheet.create({
     fontSize: 11,
   },
   logsList: {
-    maxHeight: 220,
+    ...(Platform.OS === "web"
+      ? ({
+          flexGrow: 0,
+          flexShrink: 0,
+        } as any)
+      : ({
+          maxHeight: 220,
+        } as any)),
   },
   logsContent: {
     gap: 8,
@@ -1148,7 +1450,7 @@ const styles = StyleSheet.create({
     padding: 12,
     borderWidth: 1,
     borderColor: "rgba(255,120,120,0.35)",
-    backgroundColor: "rgba(255,120,120,0.10)",
+    backgroundColor: "rgba(255,120,120,0.1)",
     gap: 6,
   },
   logCardTitle: {
