@@ -10,8 +10,7 @@ On **Web**, the app uses **Wawa Lipsync** to drive mouth morph targets from the 
 
 ## Demo
 
-- GitHub: `https://github.com/<your-username>/<repo-name>`
-- Demo video: `https://www.awesomescreenshot.com/<your-video-id>`
+- Demo video: `https://youtu.be/HtVsSOyrdqU`
 
 ---
 
@@ -281,7 +280,3 @@ If continuing beyond the assessment window, the recommended path is:
 
 “Supabase RLS policies for insert/select isolation and scoped access.”
 ![RLS policies](docs/media/06-rls-policies.png)
-
-## Demo Video
-
-[![Watch the demo](https://youtu.be/HtVsSOyrdqU)
